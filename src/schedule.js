@@ -22,7 +22,7 @@ import {
   RETRIES_MAX_COUNT,
 } from "./constants.js"
 
-const TARGET_GROUPS = ["3.1", "2.2"]
+const TARGET_GROUPS = ["GPV3.1", "GPV2.2"]
 
 let sendNotificationRetries = 0
 let getShutdownsDataRetries = 0
@@ -80,9 +80,6 @@ function generateSchedule({ data, today, group }) {
   console.log(`🌀 Generating schedule for group ${group}...`)
 
   try {
-    console.log("Available groups:", Object.keys(data[today] ?? {}))
-    console.log("Requested group:", group)
-
     const hoursStates = data[today]?.[group]
 
     if (!hoursStates) {
@@ -131,8 +128,8 @@ function generateSchedule({ data, today, group }) {
           setSchedule(
             createPeriod({
               hour,
-              startMin: 30,
-              power: true,
+              endMin: 30,
+              power: false,
             })
           )
           break
@@ -153,9 +150,10 @@ function generateMessage(schedules, update) {
   console.log("🌀 Generating message...")
 
   const sections = schedules.map(({ group, schedule }) => {
+    const displayGroup = group.replace("GPV", "")
     const hasShutdowns = schedule.some(({ power }) => !power)
 
-    const scheduleText = hasShutdowns
+    const scheduleLines = hasShutdowns
       ? schedule
           .filter(({ power }) => !power)
           .map(({ begin, end }) => `🪫 <code>${begin} — ${end}</code>`)
@@ -164,17 +162,20 @@ function generateMessage(schedules, update) {
         )
 
     return {
-      group,
-      scheduleText: scheduleText.join("\n"),
+      group: displayGroup,
+      scheduleText: scheduleLines.join("\n"),
       text: [
-        `📍 <b>Черга ${group}</b>`,
-        ...scheduleText,
+        `📍 <b>Черга ${displayGroup}</b>`,
+        ...scheduleLines,
       ].join("\n"),
     }
   })
 
   const scheduleText = sections
-    .map(({ group, scheduleText }) => `Черга ${group}\n${scheduleText}`)
+    .map(
+      ({ group, scheduleText }) =>
+        `Черга ${group}\n${scheduleText}`
+    )
     .join("\n\n")
 
   const text = [
@@ -282,15 +283,10 @@ async function run() {
   const result = await getShutdownsData()
 
   console.log("Today:", result.today)
-  console.log("Top-level keys:", Object.keys(result))
-  console.log("Data keys:", Object.keys(result.data ?? {}))
 
   const todayData = result.data?.[result.today] ?? {}
 
-  console.log(
-    "Today's data keys:",
-    Object.keys(todayData)
-  )
+  console.log("Available groups:", Object.keys(todayData))
 
   if (!Object.keys(todayData).length) {
     console.log("🔋 No schedule data found for today.")
