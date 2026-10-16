@@ -80,8 +80,14 @@ function generateSchedule({ data, today, group }) {
   console.log(`🌀 Generating schedule for group ${group}...`)
 
   try {
-    const hoursStates = data[today]?.[group]
+    console.log("Available groups:", Object.keys(data[today] ?? {}))
+console.log("Requested group:", group)
 
+const hoursStates = data[today]?.[group]
+
+if (!hoursStates) {
+  throw Error(`Group ${group} not found`)
+}
     if (!hoursStates) {
       throw Error(`Group ${group} not found`)
     }
