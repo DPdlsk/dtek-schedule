@@ -43,14 +43,14 @@ const getShutdownsData = async () => {
     const match = html.match(SHUTDOWNS_DATA_MATCHER)
 
     if (!match) {
-      throw new Error("Schedule data not found")
+      throw new Error("Shutdowns data not found in page HTML")
     }
 
-    const data = JSON.parse(match[1])
+    const result = JSON.parse(match[1])
 
     console.log("✅ Getting shutdowns data finished.")
 
-    return data
+    return result
   } catch (error) {
     console.error(
       `❌ Getting shutdowns data failed: ${error.message}.`
@@ -81,13 +81,10 @@ function generateSchedule({ data, today, group }) {
 
   try {
     console.log("Available groups:", Object.keys(data[today] ?? {}))
-console.log("Requested group:", group)
+    console.log("Requested group:", group)
 
-const hoursStates = data[today]?.[group]
+    const hoursStates = data[today]?.[group]
 
-if (!hoursStates) {
-  throw Error(`Group ${group} not found`)
-}
     if (!hoursStates) {
       throw Error(`Group ${group} not found`)
     }
@@ -142,7 +139,7 @@ if (!hoursStates) {
       }
     })
 
-    console.log(`✅ Schedule generated for group ${group}.`)
+    console.log(`✅ Generating schedule for group ${group} finished.`)
 
     return schedule
   } catch (error) {
@@ -152,36 +149,40 @@ if (!hoursStates) {
   }
 }
 
-function generateMessage(schedules = [], update) {
+function generateMessage(schedules, update) {
   console.log("🌀 Generating message...")
 
   const sections = schedules.map(({ group, schedule }) => {
     const hasShutdowns = schedule.some(({ power }) => !power)
 
-    const periods = hasShutdowns
-      ? schedule.filter(({ power }) => !power)
-      : schedule
+    const scheduleText = hasShutdowns
+      ? schedule
+          .filter(({ power }) => !power)
+          .map(({ begin, end }) => `🪫 <code>${begin} — ${end}</code>`)
+      : schedule.map(
+          ({ begin, end }) => `🔋 <code>${begin} — ${end}</code>`
+        )
 
-    const scheduleText = periods
-      .map(({ begin, end, power }) =>
-        `${power ? "🔋" : "🪫"} <code>${begin} — ${end}</code>`
-      )
-      .join("\n")
-
-    return [
-      `<b>Черга ${group}</b>`,
-      scheduleText || "Немає даних про години",
-    ].join("\n")
+    return {
+      group,
+      scheduleText: scheduleText.join("\n"),
+      text: [
+        `📍 <b>Черга ${group}</b>`,
+        ...scheduleText,
+      ].join("\n"),
+    }
   })
 
-  const scheduleText = sections.join("\n\n")
+  const scheduleText = sections
+    .map(({ group, scheduleText }) => `Черга ${group}\n${scheduleText}`)
+    .join("\n\n")
 
   const text = [
     "⚡️ <b>Графік відключень на сьогодні:</b>",
     "",
-    scheduleText,
+    ...sections.map(({ text }) => text),
     "",
-    `📢 <i>${update ?? ""}</i>`,
+    `📢 <i>${update ?? "Оновлення сайту ДТЕК"}</i>`,
     `🤖 <i>${getCurrentTime()}</i>`,
   ].join("\n")
 
@@ -201,12 +202,9 @@ async function sendNotification({ text, scheduleText }) {
 
   const lastMessage = loadLastMessage() || {}
 
-  const isScheduleChanged =
-    lastMessage.scheduleText !== scheduleText
-
+  const isScheduleChanged = lastMessage.scheduleText !== scheduleText
   const isEdit =
     Boolean(lastMessage.message_id) && !isScheduleChanged
-
   const isReply =
     Boolean(lastMessage.message_id) && isScheduleChanged
 
@@ -238,19 +236,19 @@ async function sendNotification({ text, scheduleText }) {
       }
     )
 
-    const data = await response.json()
+    const result = await response.json()
 
-    if (data.description?.includes("not modified")) {
+    if (result.description?.includes("not modified")) {
       console.log("🟡 Notification not changed.")
       return
     }
 
-    if (!data.ok) {
-      throw Error(data.description || "Telegram API error")
+    if (!result.ok) {
+      throw Error(result.description)
     }
 
     saveLastMessage({
-      ...data.result,
+      ...result.result,
       scheduleText,
     })
 
@@ -281,25 +279,34 @@ async function sendNotification({ text, scheduleText }) {
 }
 
 async function run() {
-  const data = await getShutdownsData()
+  const result = await getShutdownsData()
 
-  const groups = data.data?.[data.today] ?? {}
+  console.log("Today:", result.today)
+  console.log("Top-level keys:", Object.keys(result))
+  console.log("Data keys:", Object.keys(result.data ?? {}))
 
-  if (!Object.keys(groups).length) {
-    console.log("🔋 No schedule for today.")
+  const todayData = result.data?.[result.today] ?? {}
+
+  console.log(
+    "Today's data keys:",
+    Object.keys(todayData)
+  )
+
+  if (!Object.keys(todayData).length) {
+    console.log("🔋 No schedule data found for today.")
     return
   }
 
   const schedules = TARGET_GROUPS.map((group) => ({
     group,
     schedule: generateSchedule({
-      data,
-      today: data.today,
+      data: result.data,
+      today: result.today,
       group,
     }),
   }))
 
-  const message = generateMessage(schedules, data.update)
+  const message = generateMessage(schedules, result.update)
 
   await sendNotification(message)
 }
@@ -308,4 +315,3 @@ run().catch((error) => {
   console.error(error.message)
   process.exitCode = 1
 })
-    
