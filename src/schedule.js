@@ -287,9 +287,10 @@ async function run() {
   const schedules = TARGET_GROUPS.map((group) => ({
     group,
     schedule: generateSchedule({
-      data: data.data,
-      today: data.today,
-      group,
+  data,
+  today: data.today,
+  group,
+}),
     }),
   }))
 
