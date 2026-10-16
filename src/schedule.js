@@ -1,4 +1,3 @@
-
 import { chromium } from "playwright"
 
 import {
@@ -128,15 +127,17 @@ function generateSchedule({ data, today, group }) {
           setSchedule(
             createPeriod({
               hour,
-              endMin: 30,
-              power: false,
+              startMin: 30,
+              power: true,
             })
           )
           break
       }
     })
 
-    console.log(`✅ Generating schedule for group ${group} finished.`)
+    console.log(
+      `✅ Generating schedule for group ${group} finished.`
+    )
 
     return schedule
   } catch (error) {
@@ -262,13 +263,13 @@ async function sendNotification({ text, scheduleText }) {
     deleteLastMessage()
 
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
-      console.log("🌀 Try sending notification again...")
-
       await new Promise((resolve) =>
         setTimeout(resolve, RETRIES_TIMEOUT)
       )
 
       sendNotificationRetries++
+
+      console.log("🌀 Try sending notification again...")
 
       return await sendNotification({ text, scheduleText })
     }
@@ -290,6 +291,17 @@ async function run() {
 
   if (!Object.keys(todayData).length) {
     console.log("🔋 No schedule data found for today.")
+
+    await sendNotification({
+      text: [
+        "⚠️ <b>Графік відключень на сьогодні ще не опублікований.</b>",
+        "",
+        `📢 <i>${result.update ?? "Дані ДТЕК"}</i>`,
+        `🤖 <i>Перевірено: ${getCurrentTime()}</i>`,
+      ].join("\n"),
+      scheduleText: "NO_SCHEDULE",
+    })
+
     return
   }
 
@@ -311,3 +323,4 @@ run().catch((error) => {
   console.error(error.message)
   process.exitCode = 1
 })
+      
