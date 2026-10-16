@@ -287,10 +287,9 @@ async function run() {
   const schedules = TARGET_GROUPS.map((group) => ({
     group,
     schedule: generateSchedule({
-  data,
-  today: data.today,
-  group,
-}),
+      data,
+      today: data.today,
+      group,
     }),
   }))
 
@@ -303,3 +302,4 @@ run().catch((error) => {
   console.error(error.message)
   process.exitCode = 1
 })
+    
