@@ -232,8 +232,12 @@ function generateMessage(schedules, update, dateLabel = "сьогодні") {
     )
     .join("\n\n")
 
+  const isTomorrow = dateLabel.startsWith("завтра")
+
   const text = [
-    `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
+    isTomorrow
+      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel.slice(8)})</b> 📅`
+      : `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
     "",
     ...sections.map(({ text }) => text),
     "",
@@ -392,7 +396,6 @@ async function sendTomorrowNotification({
       console.log(
         "🟡 Tomorrow's notification text is identical; no edit needed."
       )
-
       return
     }
 
@@ -459,6 +462,27 @@ function getAvailableSchedules(data, date) {
   }))
 }
 
+function formatScheduleDate(dateKey) {
+  const value = String(dateKey).trim()
+
+  let year
+  let month
+  let day
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    ;[year, month, day] = value.split("-")
+  } else if (/^\d{2}\.\d{2}\.\d{4}$/.test(value)) {
+    ;[day, month, year] = value.split(".")
+  } else if (/^\d{4}\.\d{2}\.\d{2}$/.test(value)) {
+    ;[year, month, day] = value.split(".")
+  } else {
+    console.warn(`⚠️ Unrecognized schedule date format: ${value}`)
+    return value
+  }
+
+  return `${day}.${month}.${year}`
+}
+
 async function run() {
   console.log("Configured groups:", TARGET_GROUPS)
 
@@ -509,14 +533,7 @@ async function run() {
     return
   }
 
-  const formattedTomorrow = new Date(
-    `${tomorrow}T12:00:00+03:00`
-  ).toLocaleDateString("uk-UA", {
-    timeZone: "Europe/Kyiv",
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  })
+  const formattedTomorrow = formatScheduleDate(tomorrow)
 
   const tomorrowMessage = generateMessage(
     tomorrowSchedules,
