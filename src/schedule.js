@@ -462,8 +462,21 @@ function getAvailableSchedules(data, date) {
   }))
 }
 
+
 function formatScheduleDate(dateKey) {
   const value = String(dateKey).trim()
+
+  // Unix timestamp у секундах
+  if (/^\d{10}$/.test(value)) {
+    const date = new Date(Number(value) * 1000)
+
+    return date.toLocaleDateString("uk-UA", {
+      timeZone: "Europe/Kyiv",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    })
+  }
 
   let year
   let month
