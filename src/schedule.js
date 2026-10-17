@@ -23,7 +23,19 @@ import {
   RETRIES_MAX_COUNT,
 } from "./constants.js"
 
-const TARGET_GROUPS = ["GPV3.1", "GPV2.2"]
+const TARGET_GROUPS = [
+  ...new Set(
+    (process.env.GROUPS || "3.1,2.2")
+      .split(",")
+      .map((group) => group.trim())
+      .filter(Boolean)
+      .map((group) =>
+        group.toUpperCase().startsWith("GPV")
+          ? group.toUpperCase()
+          : `GPV${group}`
+      )
+  ),
+]
 
 const TOMORROW_STATE_FILE = path.resolve(
   "artifacts",
@@ -33,12 +45,42 @@ const TOMORROW_STATE_FILE = path.resolve(
 let sendNotificationRetries = 0
 let getShutdownsDataRetries = 0
 
-const getShutdownsData = async () => {
-  console.log("🌀 Getting shutdowns data...")
-
-  const browser = await chromium.launch({ headless: true })
+function loadTomorrowMessage() {
+  if (!fs.existsSync(TOMORROW_STATE_FILE)) {
+    return null
+  }
 
   try {
+    return JSON.parse(
+      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
+    )
+  } catch (error) {
+    console.error(
+      `❌ Failed to read tomorrow state: ${error.message}`
+    )
+    return null
+  }
+}
+
+function saveTomorrowMessage(message) {
+  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
+    recursive: true,
+  })
+
+  fs.writeFileSync(
+    TOMORROW_STATE_FILE,
+    JSON.stringify(message, null, 2)
+  )
+}
+
+async function getShutdownsData() {
+  console.log("🌀 Getting shutdowns data...")
+
+  let browser
+
+  try {
+    browser = await chromium.launch({ headless: true })
+
     const browserPage = await browser.newPage()
 
     await browserPage.goto(SHUTDOWNS_PAGE, {
@@ -62,17 +104,19 @@ const getShutdownsData = async () => {
       `❌ Getting shutdowns data failed: ${error.message}.`
     )
   } finally {
-    await browser.close()
+    if (browser) {
+      await browser.close()
+    }
   }
 
   if (getShutdownsDataRetries < RETRIES_MAX_COUNT) {
+    getShutdownsDataRetries++
+
     console.log("🌀 Try getting shutdowns data again...")
 
     await new Promise((resolve) =>
       setTimeout(resolve, RETRIES_TIMEOUT)
     )
-
-    getShutdownsDataRetries++
 
     return await getShutdownsData()
   }
@@ -114,6 +158,7 @@ function generateSchedule({ data, today, group }) {
               power: true,
             })
           )
+
           setSchedule(
             createPeriod({
               hour,
@@ -131,6 +176,7 @@ function generateSchedule({ data, today, group }) {
               power: false,
             })
           )
+
           setSchedule(
             createPeriod({
               hour,
@@ -154,7 +200,7 @@ function generateSchedule({ data, today, group }) {
   }
 }
 
-function generateMessage(schedules, update) {
+function generateMessage(schedules, update, dateLabel = "сьогодні") {
   console.log("🌀 Generating message...")
 
   const sections = schedules.map(({ group, schedule }) => {
@@ -187,7 +233,7 @@ function generateMessage(schedules, update) {
     .join("\n\n")
 
   const text = [
-    "⚡️ <b>Графік відключень на сьогодні:</b>",
+    `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
     "",
     ...sections.map(({ text }) => text),
     "",
@@ -207,7 +253,7 @@ async function sendNotification({ text, scheduleText }) {
     throw Error("❌ Missing telegram chat id.")
   }
 
-  console.log("🌀 Sending notification...")
+  console.log("🌀 Sending today's notification...")
 
   const lastMessage = loadLastMessage() || {}
 
@@ -248,7 +294,7 @@ async function sendNotification({ text, scheduleText }) {
     const result = await response.json()
 
     if (result.description?.includes("not modified")) {
-      console.log("🟡 Notification not changed.")
+      console.log("🟡 Today's notification not changed.")
       return
     }
 
@@ -261,268 +307,172 @@ async function sendNotification({ text, scheduleText }) {
       scheduleText,
     })
 
-    console.log("🟢 Notification sent.")
+    console.log("🟢 Today's notification updated.")
   } catch (error) {
     console.error(
-      `❌ Sending notification failed: ${error.message}.`
+      `❌ Sending today's notification failed: ${error.message}.`
     )
 
-    // Зберігаємо message_id при тимчасових мережевих помилках.
-
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
+      sendNotificationRetries++
+
       await new Promise((resolve) =>
         setTimeout(resolve, RETRIES_TIMEOUT)
       )
 
-      sendNotificationRetries++
-
-      console.log("🌀 Try sending notification again...")
+      console.log("🌀 Try sending today's notification again...")
 
       return await sendNotification({ text, scheduleText })
     }
 
     throw Error(
-      `❌ Sending notification failed after ${RETRIES_MAX_COUNT} retries.`
+      `❌ Sending today's notification failed after ${RETRIES_MAX_COUNT} retries.`
     )
   }
 }
 
-// Окремий стан завтрашнього графіка.
-function loadTomorrowState() {
+async function sendTomorrowNotification({
+  text,
+  scheduleText,
+  scheduleDate,
+}) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw Error("❌ Missing telegram bot token.")
+  }
+
+  if (!TELEGRAM_CHAT_ID) {
+    throw Error("❌ Missing telegram chat id.")
+  }
+
+  console.log("🌀 Updating tomorrow's notification...")
+
+  const lastMessage = loadTomorrowMessage() || {}
+
+  const isSameDate = lastMessage.scheduleDate === scheduleDate
+  const isScheduleChanged =
+    !isSameDate || lastMessage.scheduleText !== scheduleText
+
+  const isEdit =
+    Boolean(lastMessage.message_id) && isSameDate
+
+  const isReply =
+    Boolean(lastMessage.message_id) && isScheduleChanged && isSameDate
+
   try {
-    if (!fs.existsSync(TOMORROW_STATE_FILE)) {
-      return null
+    const response = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${
+        isEdit ? "editMessageText" : "sendMessage"
+      }`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text,
+          parse_mode: "HTML",
+          disable_notification: checkIsNight(),
+          message_id: isEdit
+            ? lastMessage.message_id
+            : undefined,
+          reply_parameters: isReply
+            ? {
+                message_id: lastMessage.message_id,
+                allow_sending_without_reply: true,
+              }
+            : undefined,
+        }),
+      }
+    )
+
+    const result = await response.json()
+
+    if (result.description?.includes("not modified")) {
+      console.log(
+        "🟡 Tomorrow's notification text is identical; no edit needed."
+      )
+
+      return
     }
 
-    return JSON.parse(
-      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
-    )
+    if (!result.ok) {
+      throw Error(result.description)
+    }
+
+    saveTomorrowMessage({
+      message_id: result.result.message_id,
+      scheduleDate,
+      scheduleText,
+    })
+
+    console.log("🟢 Tomorrow's notification updated.")
   } catch (error) {
     console.error(
-      `⚠️ Cannot load tomorrow state: ${error.message}`
+      `❌ Updating tomorrow's notification failed: ${error.message}.`
     )
+
+    if (sendNotificationRetries < RETRIES_MAX_COUNT) {
+      sendNotificationRetries++
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, RETRIES_TIMEOUT)
+      )
+
+      console.log("🌀 Try updating tomorrow's notification again...")
+
+      return await sendTomorrowNotification({
+        text,
+        scheduleText,
+        scheduleDate,
+      })
+    }
+
+    throw Error(
+      `❌ Updating tomorrow's notification failed after ${RETRIES_MAX_COUNT} retries.`
+    )
+  }
+}
+
+function getAvailableSchedules(data, date) {
+  const dateData = data[date]
+
+  if (!dateData || !Object.keys(dateData).length) {
     return null
   }
-}
 
-function saveTomorrowState(state) {
-  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
-    recursive: true,
-  })
-
-  fs.writeFileSync(
-    TOMORROW_STATE_FILE,
-    JSON.stringify(state, null, 2)
+  const availableGroups = TARGET_GROUPS.filter(
+    (group) => dateData[group]
   )
-}
 
-function formatDate(timestamp) {
-  return new Date(Number(timestamp) * 1000).toLocaleDateString(
-    "uk-UA",
-    {
-      timeZone: "Europe/Kyiv",
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-    }
-  )
-}
-
-function hasValidSchedule(data, date, group) {
-  const states = data?.[date]?.[group]
-
-  if (!states || typeof states !== "object") {
-    return false
+  if (!availableGroups.length) {
+    return null
   }
 
-  const validStates = Object.values(PowerState)
-
-  // Відкидаємо відсутні та невідомі стани.
-  return Object.values(states).some(
-    (state) => validStates.includes(state)
-  )
-}
-
-async function publishTomorrowSchedule(result) {
-  console.log("🌀 Checking tomorrow's schedule...")
-
-  const dates = Object.keys(result.data ?? {})
-    .map(Number)
-    .filter(Number.isFinite)
-    .sort((a, b) => a - b)
-
-  const todayTimestamp = Number(result.today)
-
-  // ДТЕК передає дати як Unix timestamps.
-  const tomorrowTimestamp = dates.find(
-    (timestamp) => timestamp > todayTimestamp
-  )
-
-  if (!tomorrowTimestamp) {
-    console.log("ℹ️ No schedule date for tomorrow yet.")
-    return
-  }
-
-  const tomorrow = String(tomorrowTimestamp)
-
-  // Кожна черга перевіряється незалежно.
-  const availableGroups = TARGET_GROUPS.filter((group) =>
-    hasValidSchedule(result.data, tomorrow, group)
-  )
-
-  if (availableGroups.length === 0) {
-    console.log(
-      "ℹ️ No valid schedules for target groups tomorrow."
-    )
-    return
-  }
-
-  const schedules = availableGroups.map((group) => ({
+  return availableGroups.map((group) => ({
     group,
     schedule: generateSchedule({
-      data: result.data,
-      today: tomorrow,
+      data,
+      today: date,
       group,
     }),
   }))
-
-  // Порівнюємо години та стани, ігноруючи час оновлення ДТЕК.
-  const scheduleText = JSON.stringify(
-    schedules.map(({ group, schedule }) => ({
-      group,
-      schedule: schedule.map(({ begin, end, power }) => ({
-        begin,
-        end,
-        power,
-      })),
-    }))
-  )
-
-  const previous = loadTomorrowState()
-
-  if (
-    previous?.date === tomorrow &&
-    previous?.scheduleText === scheduleText
-  ) {
-    console.log("🟡 Tomorrow's schedule has not changed.")
-    return
-  }
-
-  const sections = schedules.map(({ group, schedule }) => {
-    const displayGroup = group.replace("GPV", "")
-    const hasShutdowns = schedule.some(({ power }) => !power)
-
-    const lines = hasShutdowns
-      ? schedule
-          .filter(({ power }) => !power)
-          .map(({ begin, end }) => `🪫 <code>${begin} — ${end}</code>`)
-      : schedule.map(
-          ({ begin, end }) => `🔋 <code>${begin} — ${end}</code>`
-        )
-
-    return [
-      `📍 <b>Черга ${displayGroup}</b>`,
-      ...lines,
-    ].join("\n")
-  })
-
-  const text = [
-    `📅 <b>Графік відключень на завтра — ${formatDate(tomorrowTimestamp)}</b>`,
-    "",
-    ...sections,
-    "",
-    `📢 <i>${result.update ?? "Дані ДТЕК"}</i>`,
-    `🤖 <i>${getCurrentTime()}</i>`,
-  ].join("\n")
-
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    throw Error("Missing Telegram bot token or chat ID.")
-  }
-
-  console.log("🌀 Publishing tomorrow's schedule...")
-
-  // Окремі повторні спроби для завтрашнього повідомлення.
-  let lastError
-
-  for (let attempt = 0; attempt <= RETRIES_MAX_COUNT; attempt++) {
-    try {
-      const response = await fetch(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            chat_id: TELEGRAM_CHAT_ID,
-            text,
-            parse_mode: "HTML",
-            disable_notification: checkIsNight(),
-          }),
-        }
-      )
-
-      const telegramResult = await response.json()
-
-      if (!response.ok || !telegramResult.ok) {
-        throw Error(
-          telegramResult.description ?? `HTTP ${response.status}`
-        )
-      }
-
-      // Зберігаємо стан тільки після успішної публікації.
-      saveTomorrowState({
-        date: tomorrow,
-        scheduleText,
-        message_id: telegramResult.result.message_id,
-        chat_id: telegramResult.result.chat.id,
-      })
-
-      console.log("🟢 Tomorrow's schedule published.")
-      return
-    } catch (error) {
-      lastError = error
-
-      console.error(
-        `❌ Tomorrow notification failed: ${error.message}.`
-      )
-
-      if (attempt < RETRIES_MAX_COUNT) {
-        console.log("🌀 Retrying tomorrow notification...")
-
-        await new Promise((resolve) =>
-          setTimeout(resolve, RETRIES_TIMEOUT)
-        )
-      }
-    }
-  }
-
-  // Не зберігаємо новий стан, якщо публікація не підтверджена.
-  throw Error(
-    `Tomorrow notification failed after retries: ${lastError?.message}`
-  )
 }
 
 async function run() {
+  console.log("Configured groups:", TARGET_GROUPS)
+
   const result = await getShutdownsData()
 
   console.log("Today:", result.today)
-  console.log("Available dates:", Object.keys(result.data ?? {}))
 
-  // Завтрашній сценарій незалежний від сьогоднішнього.
-  try {
-    await publishTomorrowSchedule(result)
-  } catch (error) {
-    console.error(
-      `❌ Tomorrow schedule processing failed: ${error.message}`
-    )
-  }
+  const dates = Object.keys(result.data ?? {}).sort()
+  console.log("Available dates:", dates)
 
-  const todayData = result.data?.[result.today] ?? {}
+  const today = result.today
+  const todaySchedules = getAvailableSchedules(result.data ?? {}, today)
 
-  console.log("Available groups:", Object.keys(todayData))
-
-  if (!Object.keys(todayData).length) {
+  if (!todaySchedules) {
     console.log("🔋 No schedule data found for today.")
 
     await sendNotification({
@@ -538,27 +488,46 @@ async function run() {
     return
   }
 
-  const schedules = TARGET_GROUPS
-    .filter((group) =>
-      hasValidSchedule(result.data, result.today, group)
-    )
-    .map((group) => ({
-      group,
-      schedule: generateSchedule({
-        data: result.data,
-        today: result.today,
-        group,
-      }),
-    }))
+  await sendNotification(
+    generateMessage(todaySchedules, result.update, "сьогодні")
+  )
 
-  if (schedules.length === 0) {
-    console.log("⚠️ No valid schedules for today's target groups.")
+  const tomorrow = dates.find((date) => date > today)
+
+  if (!tomorrow) {
+    console.log("🟡 No data available for tomorrow.")
     return
   }
 
-  const message = generateMessage(schedules, result.update)
+  const tomorrowSchedules = getAvailableSchedules(
+    result.data ?? {},
+    tomorrow
+  )
 
-  await sendNotification(message)
+  if (!tomorrowSchedules) {
+    console.log("🟡 Tomorrow's schedule has not been published yet.")
+    return
+  }
+
+  const formattedTomorrow = new Date(
+    `${tomorrow}T12:00:00+03:00`
+  ).toLocaleDateString("uk-UA", {
+    timeZone: "Europe/Kyiv",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  })
+
+  const tomorrowMessage = generateMessage(
+    tomorrowSchedules,
+    result.update,
+    `завтра — ${formattedTomorrow}`
+  )
+
+  await sendTomorrowNotification({
+    ...tomorrowMessage,
+    scheduleDate: tomorrow,
+  })
 }
 
 run().catch((error) => {
