@@ -236,7 +236,7 @@ function generateMessage(schedules, update, dateLabel = "сьогодні") {
 
   const text = [
     isTomorrow
-      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel.slice(8)})</b> 📅`
+      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel.slice(8).trim()})</b> 📅`
       : `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
     "",
     ...sections.map(({ text }) => text),
