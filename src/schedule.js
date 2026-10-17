@@ -260,7 +260,7 @@ async function sendNotification({ text, scheduleText }) {
       `❌ Sending notification failed: ${error.message}.`
     )
 
-    deleteLastMessage()
+    //deleteLastMessage()
 
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
       await new Promise((resolve) =>
