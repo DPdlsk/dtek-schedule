@@ -284,6 +284,7 @@ async function run() {
   const result = await getShutdownsData()
 
   console.log("Today:", result.today)
+  console.log("Available dates:", Object.keys(result.data ?? {}))
 
   const todayData = result.data?.[result.today] ?? {}
 
