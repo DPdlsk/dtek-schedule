@@ -1,4 +1,7 @@
+
 import { chromium } from "playwright"
+import fs from "node:fs"
+import path from "node:path"
 
 import {
   checkIsNight,
@@ -6,7 +9,6 @@ import {
   getCurrentTime,
   loadLastMessage,
   saveLastMessage,
-  deleteLastMessage,
   useSchedule,
 } from "./helpers.js"
 
@@ -22,6 +24,11 @@ import {
 } from "./constants.js"
 
 const TARGET_GROUPS = ["GPV3.1", "GPV2.2"]
+
+const TOMORROW_STATE_FILE = path.resolve(
+  "artifacts",
+  "last-tomorrow-schedule.json"
+)
 
 let sendNotificationRetries = 0
 let getShutdownsDataRetries = 0
@@ -260,7 +267,7 @@ async function sendNotification({ text, scheduleText }) {
       `❌ Sending notification failed: ${error.message}.`
     )
 
-    //deleteLastMessage()
+    // Зберігаємо message_id при тимчасових мережевих помилках.
 
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
       await new Promise((resolve) =>
@@ -280,11 +287,236 @@ async function sendNotification({ text, scheduleText }) {
   }
 }
 
+// Окремий стан завтрашнього графіка.
+function loadTomorrowState() {
+  try {
+    if (!fs.existsSync(TOMORROW_STATE_FILE)) {
+      return null
+    }
+
+    return JSON.parse(
+      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
+    )
+  } catch (error) {
+    console.error(
+      `⚠️ Cannot load tomorrow state: ${error.message}`
+    )
+    return null
+  }
+}
+
+function saveTomorrowState(state) {
+  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
+    recursive: true,
+  })
+
+  fs.writeFileSync(
+    TOMORROW_STATE_FILE,
+    JSON.stringify(state, null, 2)
+  )
+}
+
+function formatDate(timestamp) {
+  return new Date(Number(timestamp) * 1000).toLocaleDateString(
+    "uk-UA",
+    {
+      timeZone: "Europe/Kyiv",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    }
+  )
+}
+
+function hasValidSchedule(data, date, group) {
+  const states = data?.[date]?.[group]
+
+  if (!states || typeof states !== "object") {
+    return false
+  }
+
+  const validStates = Object.values(PowerState)
+
+  // Відкидаємо відсутні та невідомі стани.
+  return Object.values(states).some(
+    (state) => validStates.includes(state)
+  )
+}
+
+async function publishTomorrowSchedule(result) {
+  console.log("🌀 Checking tomorrow's schedule...")
+
+  const dates = Object.keys(result.data ?? {})
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b)
+
+  const todayTimestamp = Number(result.today)
+
+  // ДТЕК передає дати як Unix timestamps.
+  const tomorrowTimestamp = dates.find(
+    (timestamp) => timestamp > todayTimestamp
+  )
+
+  if (!tomorrowTimestamp) {
+    console.log("ℹ️ No schedule date for tomorrow yet.")
+    return
+  }
+
+  const tomorrow = String(tomorrowTimestamp)
+
+  // Кожна черга перевіряється незалежно.
+  const availableGroups = TARGET_GROUPS.filter((group) =>
+    hasValidSchedule(result.data, tomorrow, group)
+  )
+
+  if (availableGroups.length === 0) {
+    console.log(
+      "ℹ️ No valid schedules for target groups tomorrow."
+    )
+    return
+  }
+
+  const schedules = availableGroups.map((group) => ({
+    group,
+    schedule: generateSchedule({
+      data: result.data,
+      today: tomorrow,
+      group,
+    }),
+  }))
+
+  // Порівнюємо години та стани, ігноруючи час оновлення ДТЕК.
+  const scheduleText = JSON.stringify(
+    schedules.map(({ group, schedule }) => ({
+      group,
+      schedule: schedule.map(({ begin, end, power }) => ({
+        begin,
+        end,
+        power,
+      })),
+    }))
+  )
+
+  const previous = loadTomorrowState()
+
+  if (
+    previous?.date === tomorrow &&
+    previous?.scheduleText === scheduleText
+  ) {
+    console.log("🟡 Tomorrow's schedule has not changed.")
+    return
+  }
+
+  const sections = schedules.map(({ group, schedule }) => {
+    const displayGroup = group.replace("GPV", "")
+    const hasShutdowns = schedule.some(({ power }) => !power)
+
+    const lines = hasShutdowns
+      ? schedule
+          .filter(({ power }) => !power)
+          .map(({ begin, end }) => `🪫 <code>${begin} — ${end}</code>`)
+      : schedule.map(
+          ({ begin, end }) => `🔋 <code>${begin} — ${end}</code>`
+        )
+
+    return [
+      `📍 <b>Черга ${displayGroup}</b>`,
+      ...lines,
+    ].join("\n")
+  })
+
+  const text = [
+    `📅 <b>Графік відключень на завтра — ${formatDate(tomorrowTimestamp)}</b>`,
+    "",
+    ...sections,
+    "",
+    `📢 <i>${result.update ?? "Дані ДТЕК"}</i>`,
+    `🤖 <i>${getCurrentTime()}</i>`,
+  ].join("\n")
+
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    throw Error("Missing Telegram bot token or chat ID.")
+  }
+
+  console.log("🌀 Publishing tomorrow's schedule...")
+
+  // Окремі повторні спроби для завтрашнього повідомлення.
+  let lastError
+
+  for (let attempt = 0; attempt <= RETRIES_MAX_COUNT; attempt++) {
+    try {
+      const response = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: TELEGRAM_CHAT_ID,
+            text,
+            parse_mode: "HTML",
+            disable_notification: checkIsNight(),
+          }),
+        }
+      )
+
+      const telegramResult = await response.json()
+
+      if (!response.ok || !telegramResult.ok) {
+        throw Error(
+          telegramResult.description ?? `HTTP ${response.status}`
+        )
+      }
+
+      // Зберігаємо стан тільки після успішної публікації.
+      saveTomorrowState({
+        date: tomorrow,
+        scheduleText,
+        message_id: telegramResult.result.message_id,
+        chat_id: telegramResult.result.chat.id,
+      })
+
+      console.log("🟢 Tomorrow's schedule published.")
+      return
+    } catch (error) {
+      lastError = error
+
+      console.error(
+        `❌ Tomorrow notification failed: ${error.message}.`
+      )
+
+      if (attempt < RETRIES_MAX_COUNT) {
+        console.log("🌀 Retrying tomorrow notification...")
+
+        await new Promise((resolve) =>
+          setTimeout(resolve, RETRIES_TIMEOUT)
+        )
+      }
+    }
+  }
+
+  // Не зберігаємо новий стан, якщо публікація не підтверджена.
+  throw Error(
+    `Tomorrow notification failed after retries: ${lastError?.message}`
+  )
+}
+
 async function run() {
   const result = await getShutdownsData()
 
   console.log("Today:", result.today)
   console.log("Available dates:", Object.keys(result.data ?? {}))
+
+  // Завтрашній сценарій незалежний від сьогоднішнього.
+  try {
+    await publishTomorrowSchedule(result)
+  } catch (error) {
+    console.error(
+      `❌ Tomorrow schedule processing failed: ${error.message}`
+    )
+  }
 
   const todayData = result.data?.[result.today] ?? {}
 
@@ -306,14 +538,23 @@ async function run() {
     return
   }
 
-  const schedules = TARGET_GROUPS.map((group) => ({
-    group,
-    schedule: generateSchedule({
-      data: result.data,
-      today: result.today,
+  const schedules = TARGET_GROUPS
+    .filter((group) =>
+      hasValidSchedule(result.data, result.today, group)
+    )
+    .map((group) => ({
       group,
-    }),
-  }))
+      schedule: generateSchedule({
+        data: result.data,
+        today: result.today,
+        group,
+      }),
+    }))
+
+  if (schedules.length === 0) {
+    console.log("⚠️ No valid schedules for today's target groups.")
+    return
+  }
 
   const message = generateMessage(schedules, result.update)
 
@@ -324,4 +565,3 @@ run().catch((error) => {
   console.error(error.message)
   process.exitCode = 1
 })
-      
