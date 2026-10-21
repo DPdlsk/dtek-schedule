@@ -22,9 +22,17 @@ import {
   RETRIES_MAX_COUNT,
 } from "./constants.js"
 
+const groupsConfig = process.env.GROUPS
+
+if (!groupsConfig?.trim()) {
+  throw new Error(
+    "❌ Missing GROUPS environment variable. Configure the GROUPS secret."
+  )
+}
+
 const TARGET_GROUPS = [
   ...new Set(
-    (process.env.GROUPS || process.env.GROUP || "3.1,2.2")
+    groupsConfig
       .split(",")
       .map((group) => group.trim())
       .filter(Boolean)
@@ -35,6 +43,8 @@ const TARGET_GROUPS = [
       )
   ),
 ]
+
+console.log("Configured groups:", TARGET_GROUPS)
 
 const TOMORROW_STATE_FILE = path.resolve(
   "artifacts",
