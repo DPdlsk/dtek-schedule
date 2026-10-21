@@ -309,16 +309,16 @@ async function processSwitchingAlerts(
       continue
     }
 
-    const displayGroup = event.group.replace("GPV", "")
-
-    const action = event.power
-      ? "увімкнення світла"
-      : "відключення світла"
-
-    await sendSwitchingMessage(
-      `⏰ <b>Нагадування про перемикання</b>\n` +
-        `Черга ${displayGroup}: ${action} о <b>${event.time}</b> (сьогодні).`
-    )
+  const action = event.power
+    ? "увімкнення світла"
+    : "відключення світла"
+  
+  const batteryIcon = event.power ? "🔋" : "🪫"
+  
+  await sendSwitchingMessage(
+    `⏰ <b>Нагадування про перемикання ${batteryIcon}</b>\n` +
+      `Черга ${displayGroup}: ${action} о <b>${event.time}</b> (сьогодні).`
+  )
 
     sentWarnings.add(event.id)
   }
