@@ -24,7 +24,7 @@ import {
 
 const TARGET_GROUPS = [
   ...new Set(
-    (process.env.GROUPS || "3.1,2.2")
+    (process.env.GROUPS || process.env.GROUP || "3.1,2.2")
       .split(",")
       .map((group) => group.trim())
       .filter(Boolean)
@@ -41,7 +41,6 @@ const TOMORROW_STATE_FILE = path.resolve(
   "last-tomorrow-schedule.json"
 )
 
-// Стан нагадувань зберігається в гілці artifacts.
 const SWITCHING_STATE_FILE = path.resolve(
   "artifacts",
   "switching-alert-state.json"
@@ -65,13 +64,7 @@ function loadSwitchingState() {
         ? state.sentWarnings
         : [],
     }
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.error(
-        `⚠️ Failed to read switching state: ${error.message}`
-      )
-    }
-
+  } catch {
     return {
       nextSwitches: {},
       sentWarnings: [],
@@ -155,7 +148,6 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
   if (minutes === null || !dateIso) return null
 
   const [year, month, day] = dateIso.split("-").map(Number)
-
   const dayOffset = minutes === 1440 ? 1 : 0
   const normalizedMinutes = minutes === 1440 ? 0 : minutes
   const hour = Math.floor(normalizedMinutes / 60)
@@ -169,8 +161,7 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
     minute
   )
 
-  // Визначаємо фактичний UTC offset для Europe/Kyiv,
-  // ураховуючи перехід на літній і зимовий час.
+  // Визначаємо фактичний UTC offset для Europe/Kyiv.
   let timestamp = targetUtcLike
 
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -197,7 +188,6 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
     )
 
     const difference = targetUtcLike - representedUtcLike
-
     timestamp += difference
 
     if (difference === 0) break
@@ -240,7 +230,7 @@ function getSwitchingEvents(schedules, dateKey, now = new Date()) {
       const previousEnd = parseScheduleClock(previous.end)
       const currentBegin = parseScheduleClock(current.begin)
 
-      // Вважаємо це перемиканням лише тоді, коли періоди суміжні.
+      // Періоди мають бути суміжними, щоб визначати перемикання.
       if (
         previousEnd === null ||
         currentBegin === null ||
@@ -301,12 +291,8 @@ function compareGroupNumbers(groupA, groupB) {
 }
 
 async function sendSwitchingMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    throw Error("Missing Telegram bot token.")
-  }
-
-  if (!TELEGRAM_CHAT_ID) {
-    throw Error("Missing Telegram chat id.")
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    throw Error("Missing Telegram bot token or chat id.")
   }
 
   const response = await fetch(
@@ -362,13 +348,9 @@ async function processSwitchingAlerts(
       )
       .sort((a, b) => a.timestamp - b.timestamp)[0]
 
-    if (next) {
-      nextByGroup[group] = next
-    }
+    if (next) nextByGroup[group] = next
   }
 
-  // Повідомляємо про зміну часу найближчого перемикання,
-  // якщо попередній час був у межах найближчої години.
   let correctionNeeded = false
 
   for (const [group, previous] of Object.entries(
@@ -408,7 +390,7 @@ async function processSwitchingAlerts(
     )
   })
 
-  // Групуємо одночасні перемикання, щоб надіслати одне повідомлення.
+  // Групуємо події за точним часом перемикання.
   const eventsByTime = new Map()
 
   for (const event of dueEvents) {
@@ -490,6 +472,108 @@ function saveTomorrowMessage(message) {
   )
 }
 
+// Читаємо тільки блок поточного повідомлення над формою пошуку адреси.
+// Не скануємо всю сторінку, щоб не сплутати актуальний статус із FAQ.
+function extractCurrentNotice(pageText) {
+  const text = String(pageText ?? "").replace(/\u00a0/g, " ")
+  const startMatch = /Шановні клієнти!\s*/iu.exec(text)
+
+  if (!startMatch) {
+    return null
+  }
+
+  const start = startMatch.index + startMatch[0].length
+  const endMarker = "Перевірка поточних відключень за адресою"
+  const end = text.indexOf(endMarker, start)
+
+  const notice = text
+    .slice(start, end >= 0 ? end : start + 1600)
+    .trim()
+
+  return notice || null
+}
+
+function detectOutageMode(noticeText) {
+  if (!noticeText) {
+    return {
+      mode: "unknown",
+      reason: "current DTEK notice section was not found",
+    }
+  }
+
+  const text = noticeText
+    .toLocaleLowerCase("uk-UA")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  const schedulesInactive =
+    /графік[а-яіїєґ\s-]{0,80}\bне\s+(?:діють|діє|застосовуються|застосовується)\b/u.test(text) ||
+    /\bне\s+(?:діють|застосовуються)\b[^.]{0,80}\bграфік/u.test(text)
+
+  const mentionsEmergency =
+    /екстрен[а-яіїєґ]*\s+відключ/iu.test(text)
+
+  const emergencyExplicitlyIntroduced =
+    /(?:введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*|застосован[а-яіїєґ]*|оголошен[а-яіїєґ]*|діють)[^.!?]{0,100}екстрен[а-яіїєґ]*\s+відключ/iu.test(text)
+
+  // Згадка "уникнути екстрених відключень" не означає,
+  // що екстрені відключення вже введено.
+  if (
+    emergencyExplicitlyIntroduced ||
+    (mentionsEmergency && schedulesInactive)
+  ) {
+    return {
+      mode: "emergency",
+      reason: "active emergency-outage wording found in the current notice",
+    }
+  }
+
+  const mentionsAccident =
+    /аварійн[а-яіїєґ]*\s+відключ/iu.test(text)
+
+  const accidentExplicitlyReported =
+    /(?:зафіксован[а-яіїєґ]*|сталися|сталося|сталася|відбуваються|введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*)[^.!?]{0,120}аварійн[а-яіїєґ]*\s+відключ/iu.test(text)
+
+  if (
+    mentionsAccident &&
+    (schedulesInactive || accidentExplicitlyReported)
+  ) {
+    return {
+      mode: "accident",
+      reason: "active accident-outage wording found in the current notice",
+    }
+  }
+
+  return {
+    mode: "normal",
+    reason: "no active emergency/accident outage notice detected",
+  }
+}
+
+function getOutageModeMessage(mode, update) {
+  const messages = {
+    emergency:
+      "🚨 <b>Екстрені відключення. Планові графіки не діють.</b>",
+    accident:
+      "⚠️ <b>Аварійні відключення. Планові графіки не діють.</b>",
+    unknown:
+      "⚠️ <b>Не вдалося визначити актуальний статус графіків ДТЕК.</b>\nПланові нагадування тимчасово призупинено, доки бот не зможе перевірити повідомлення сайту.",
+  }
+
+  return [
+    messages[mode] ?? messages.unknown,
+    "",
+    `🕒 <i>Останнє оновлення ДТЕК: ${update ?? "невідомо"}</i>`,
+    `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
+  ].join("\n")
+}
+
+function pauseSwitchingAlerts() {
+  const state = loadSwitchingState()
+  state.nextSwitches = {}
+  saveSwitchingState(state)
+}
+
 async function getShutdownsData() {
   console.log("🌀 Getting shutdowns data...")
 
@@ -507,69 +591,50 @@ async function getShutdownsData() {
       waitUntil: "load",
     })
 
-    // ДІАГНОСТИКА: шукаємо в тексті сторінки згадки про аварійні
-    // та екстрені відключення. На роботу бота цей блок не впливає.
     const pageText = await browserPage.locator("body").innerText()
-    const normalizedText = pageText.replace(/\u00a0/g, " ")
-
-    const keywords = [
-      /аварійн[а-яіїєґ\s-]{0,50}відключ/giu,
-      /екстрен[а-яіїєґ\s-]{0,50}відключ/giu,
-      /графік[а-яіїєґ\s-]{0,40}не діють/giu,
-      /графік[а-яіїєґ\s-]{0,40}не застосов/giu,
-    ]
-
-    const diagnosticSnippets = new Set()
-
-    for (const pattern of keywords) {
-      for (const match of normalizedText.matchAll(pattern)) {
-        const start = Math.max(0, match.index - 220)
-
-        const end = Math.min(
-          normalizedText.length,
-          match.index + match[0].length + 320
-        )
-
-        diagnosticSnippets.add(
-          normalizedText
-            .slice(start, end)
-            .replace(/\n{3,}/g, "\n\n")
-            .trim()
-        )
-      }
-    }
+    const noticeText = extractCurrentNotice(pageText)
+    const outageStatus = detectOutageMode(noticeText)
 
     console.log(
-      "[DIAGNOSTIC] Current-page outage-related text snippets:"
+      `[OUTAGE STATUS] ${outageStatus.mode}: ${outageStatus.reason}`
     )
 
-    if (diagnosticSnippets.size) {
-      let index = 0
-
-      for (const snippet of diagnosticSnippets) {
-        index++
-
-        console.log(
-          `[DIAGNOSTIC] Snippet ${index}: ${JSON.stringify(snippet)}`
-        )
-      }
-    } else {
-      console.log(
-        "[DIAGNOSTIC] No outage-related keywords found in visible page text."
-      )
-    }
+    console.log(
+      "[OUTAGE NOTICE]",
+      noticeText
+        ? JSON.stringify(noticeText)
+        : "(current notice not found)"
+    )
 
     const html = await browserPage.content()
     const match = html.match(SHUTDOWNS_DATA_MATCHER)
 
+    // Якщо є підтверджене попередження, його можна показати,
+    // навіть коли JSON погодинного графіка тимчасово недоступний.
     if (!match) {
+      if (
+        outageStatus.mode === "emergency" ||
+        outageStatus.mode === "accident"
+      ) {
+        console.warn(
+          "⚠️ Schedule JSON is unavailable, but an active outage notice was detected."
+        )
+
+        return {
+          today: null,
+          data: {},
+          update: null,
+          outageMode: outageStatus.mode,
+          outageNotice: noticeText,
+        }
+      }
+
       throw new Error("Shutdowns data not found in page HTML")
     }
 
     const result = JSON.parse(match[1])
 
-    // ДІАГНОСТИКА: перевіряємо, чи містить JSON дані про черги
-    // окремий статус аварійного або екстреного відключення.
+    // Діагностика сирих даних черг.
     const todayGroupData = result.data?.[result.today] ?? {}
 
     for (const group of TARGET_GROUPS) {
@@ -581,7 +646,11 @@ async function getShutdownsData() {
 
     console.log("✅ Getting shutdowns data finished.")
 
-    return result
+    return {
+      ...result,
+      outageMode: outageStatus.mode,
+      outageNotice: noticeText,
+    }
   } catch (error) {
     console.error(
       `❌ Getting shutdowns data failed: ${error.message}.`
@@ -610,9 +679,7 @@ async function getShutdownsData() {
 }
 
 function generateSchedule({ data, today, group }) {
-  console.log(
-    `🌀 Generating schedule for group ${group}...`
-  )
+  console.log(`🌀 Generating schedule for group ${group}...`)
 
   try {
     const hoursStates = data[today]?.[group]
@@ -628,21 +695,11 @@ function generateSchedule({ data, today, group }) {
 
       switch (state) {
         case PowerState.ON:
-          setSchedule(
-            createPeriod({
-              hour,
-              power: true,
-            })
-          )
+          setSchedule(createPeriod({ hour, power: true }))
           break
 
         case PowerState.OFF:
-          setSchedule(
-            createPeriod({
-              hour,
-              power: false,
-            })
-          )
+          setSchedule(createPeriod({ hour, power: false }))
           break
 
         case PowerState.HALF_ON:
@@ -704,10 +761,7 @@ function generateMessage(
 
   const sections = schedules.map(({ group, schedule }) => {
     const displayGroup = group.replace(/^GPV/i, "")
-
-    const hasShutdowns = schedule.some(
-      ({ power }) => !power
-    )
+    const hasShutdowns = schedule.some(({ power }) => !power)
 
     const scheduleLines = hasShutdowns
       ? schedule
@@ -747,10 +801,7 @@ function generateMessage(
     `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
   ].join("\n")
 
-  return {
-    text,
-    scheduleText,
-  }
+  return { text, scheduleText }
 }
 
 async function sendNotification({ text, scheduleText }) {
@@ -766,16 +817,34 @@ async function sendNotification({ text, scheduleText }) {
 
   const lastMessage = loadLastMessage() || {}
 
+  const previousScheduleText = String(
+    lastMessage.scheduleText ?? ""
+  )
+
+  const wasConfirmedOutageMode =
+    previousScheduleText === "OUTAGE_MODE:emergency" ||
+    previousScheduleText === "OUTAGE_MODE:accident"
+
+  const isNowOutageMode = String(scheduleText).startsWith(
+    "OUTAGE_MODE:"
+  )
+
+  if (wasConfirmedOutageMode && !isNowOutageMode) {
+    text = [
+      "✅ <b>Сайт ДТЕК більше не показує активне повідомлення про аварійні або екстрені відключення.</b>",
+      "",
+      text,
+    ].join("\n")
+  }
+
   const isScheduleChanged =
     lastMessage.scheduleText !== scheduleText
 
   const isEdit =
-    Boolean(lastMessage.message_id) &&
-    !isScheduleChanged
+    Boolean(lastMessage.message_id) && !isScheduleChanged
 
   const isReply =
-    Boolean(lastMessage.message_id) &&
-    isScheduleChanged
+    Boolean(lastMessage.message_id) && isScheduleChanged
 
   try {
     const response = await fetch(
@@ -834,14 +903,9 @@ async function sendNotification({ text, scheduleText }) {
         setTimeout(resolve, RETRIES_TIMEOUT)
       )
 
-      console.log(
-        "🌀 Try sending today's notification again..."
-      )
+      console.log("🌀 Try sending today's notification again...")
 
-      return await sendNotification({
-        text,
-        scheduleText,
-      })
+      return await sendNotification({ text, scheduleText })
     }
 
     throw Error(
@@ -867,8 +931,7 @@ async function sendTomorrowNotification({
 
   const lastMessage = loadTomorrowMessage() || {}
 
-  const isSameDate =
-    lastMessage.scheduleDate === scheduleDate
+  const isSameDate = lastMessage.scheduleDate === scheduleDate
 
   const isScheduleChanged =
     !isSameDate ||
@@ -942,9 +1005,7 @@ async function sendTomorrowNotification({
         setTimeout(resolve, RETRIES_TIMEOUT)
       )
 
-      console.log(
-        "🌀 Try updating tomorrow's notification again..."
-      )
+      console.log("🌀 Try updating tomorrow's notification again...")
 
       return await sendTomorrowNotification({
         text,
@@ -1024,6 +1085,27 @@ async function run() {
   const result = await getShutdownsData()
 
   console.log("Today:", result.today)
+  console.log("Detected outage mode:", result.outageMode)
+
+  // Якщо є активний або невизначений статус, не публікуємо
+  // звичайний графік і не надсилаємо планові нагадування.
+  if (result.outageMode !== "normal") {
+    await sendNotification({
+      text: getOutageModeMessage(
+        result.outageMode,
+        result.update
+      ),
+      scheduleText: `OUTAGE_MODE:${result.outageMode}`,
+    })
+
+    pauseSwitchingAlerts()
+
+    console.log(
+      `⚠️ Plan schedule and switching alerts paused: ${result.outageMode}`
+    )
+
+    return
+  }
 
   const dates = Object.keys(result.data ?? {}).sort()
 
