@@ -41,7 +41,6 @@ const TOMORROW_STATE_FILE = path.resolve(
   "last-tomorrow-schedule.json"
 )
 
-// Persistent state for switching alerts.
 const SWITCHING_STATE_FILE = path.resolve(
   "artifacts",
   "switching-alert-state.json"
@@ -50,12 +49,56 @@ const SWITCHING_STATE_FILE = path.resolve(
 const SWITCHING_WARNING_MINUTES = 30
 const SWITCHING_CORRECTION_WINDOW_MINUTES = 60
 
-function loadSwitchingState() {
+let sendNotificationRetries = 0
+let getShutdownsDataRetries = 0
+
+function loadTomorrowMessage() {
+  if (!fs.existsSync(TOMORROW_STATE_FILE)) {
+    return null
+  }
+
   try {
     return JSON.parse(
+      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
+    )
+  } catch (error) {
+    console.error(
+      `❌ Failed to read tomorrow state: ${error.message}`
+    )
+    return null
+  }
+}
+
+function saveTomorrowMessage(message) {
+  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
+    recursive: true,
+  })
+
+  fs.writeFileSync(
+    TOMORROW_STATE_FILE,
+    JSON.stringify(message, null, 2)
+  )
+}
+
+function loadSwitchingState() {
+  try {
+    const state = JSON.parse(
       fs.readFileSync(SWITCHING_STATE_FILE, "utf8")
     )
-  } catch {
+
+    return {
+      nextSwitches: state.nextSwitches ?? {},
+      sentWarnings: Array.isArray(state.sentWarnings)
+        ? state.sentWarnings
+        : [],
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error(
+        `⚠️ Failed to read switching state: ${error.message}`
+      )
+    }
+
     return {
       nextSwitches: {},
       sentWarnings: [],
@@ -74,24 +117,8 @@ function saveSwitchingState(state) {
   )
 }
 
-function kyivDateParts(date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Kyiv",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(date)
-
-  return Object.fromEntries(
-    parts.map(({ type, value }) => [type, value])
-  )
-}
-
 function parseScheduleClock(value) {
-  const match = String(value).match(/^(\d{1,2}):(\d{2})$/)
+  const match = String(value ?? "").match(/^(\d{1,2}):(\d{2})$/)
 
   if (!match) {
     return null
@@ -101,11 +128,15 @@ function parseScheduleClock(value) {
   const minute = Number(match[2])
 
   if (
-    hour < 0 ||
-    hour > 24 ||
     minute < 0 ||
-    minute > 59
+    minute > 59 ||
+    hour < 0 ||
+    hour > 24
   ) {
+    return null
+  }
+
+  if (hour === 24 && minute !== 0) {
     return null
   }
 
@@ -130,82 +161,193 @@ function formatScheduleDateIso(dateKey) {
 
   if (/^\d{10}$/.test(value)) {
     const date = new Date(Number(value) * 1000)
-    const parts = kyivDateParts(date)
 
-    return `${parts.year}-${parts.month}-${parts.day}`
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Kyiv",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date)
+
+    const values = Object.fromEntries(
+      parts.map(({ type, value }) => [type, value])
+    )
+
+    return `${values.year}-${values.month}-${values.day}`
   }
 
   return null
 }
 
-function getSwitchingEvents(schedules, dateKey, now) {
-  const scheduleDate = formatScheduleDateIso(dateKey)
+function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
+  const minutes = parseScheduleClock(clockValue)
 
-  if (!scheduleDate) {
+  if (minutes === null || !dateIso) {
+    return null
+  }
+
+  const [year, month, day] = dateIso.split("-").map(Number)
+
+  const dayOffset = minutes === 1440 ? 1 : 0
+  const normalizedMinutes = minutes === 1440 ? 0 : minutes
+  const hour = Math.floor(normalizedMinutes / 60)
+  const minute = normalizedMinutes % 60
+
+  const targetUtcLike = Date.UTC(
+    year,
+    month - 1,
+    day + dayOffset,
+    hour,
+    minute
+  )
+
+  // Determine Kyiv's actual UTC offset using its IANA time zone.
+  let timestamp = targetUtcLike
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Kyiv",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(timestamp))
+
+    const values = Object.fromEntries(
+      parts.map(({ type, value }) => [type, value])
+    )
+
+    const representedUtcLike = Date.UTC(
+      Number(values.year),
+      Number(values.month) - 1,
+      Number(values.day),
+      Number(values.hour),
+      Number(values.minute)
+    )
+
+    const difference = targetUtcLike - representedUtcLike
+
+    timestamp += difference
+
+    if (difference === 0) {
+      break
+    }
+  }
+
+  return timestamp
+}
+
+function compareGroupNumbers(groupA, groupB) {
+  const partsA = groupA
+    .replace(/^GPV/i, "")
+    .split(".")
+    .map(Number)
+
+  const partsB = groupB
+    .replace(/^GPV/i, "")
+    .split(".")
+    .map(Number)
+
+  const length = Math.max(partsA.length, partsB.length)
+
+  for (let index = 0; index < length; index++) {
+    const a = partsA[index] ?? 0
+    const b = partsB[index] ?? 0
+
+    if (a !== b) {
+      return a - b
+    }
+  }
+
+  return 0
+}
+
+function getSwitchingEvents(schedules, dateKey, now = new Date()) {
+  const dateIso = formatScheduleDateIso(dateKey)
+
+  if (!dateIso) {
+    console.warn(
+      `⚠️ Cannot parse schedule date for switching alerts: ${dateKey}`
+    )
     return []
   }
 
-  return schedules
-    .flatMap(({ group, schedule }) => {
-      const sorted = [...schedule].sort(
-        (a, b) =>
-          (parseScheduleClock(a.begin) ?? 0) -
-          (parseScheduleClock(b.begin) ?? 0)
-      )
+  const events = schedules.flatMap(({ group, schedule }) => {
+    const sorted = [...schedule].sort(
+      (a, b) =>
+        (parseScheduleClock(a.begin) ?? -1) -
+        (parseScheduleClock(b.begin) ?? -1)
+    )
 
-      const events = []
+    const groupEvents = []
 
-      for (let i = 1; i < sorted.length; i++) {
-        const previous = sorted[i - 1]
-        const current = sorted[i]
+    for (let index = 1; index < sorted.length; index++) {
+      const previous = sorted[index - 1]
+      const current = sorted[index]
 
-        // Only record actual transitions between ON and OFF.
-        if (previous.power === current.power) {
-          continue
-        }
-
-        const minutes = parseScheduleClock(current.begin)
-
-        if (minutes === null || minutes >= 1440) {
-          continue
-        }
-
-        const hour = Math.floor(minutes / 60)
-        const minute = minutes % 60
-
-        // Kyiv uses UTC+03:00 during daylight saving time.
-        // This timestamp construction should be revisited when
-        // handling dates after the seasonal clock change.
-        const timestamp = Date.parse(
-          `${scheduleDate}T${String(hour).padStart(2, "0")}:${String(
-            minute
-          ).padStart(2, "0")}:00+03:00`
-        )
-
-        if (!Number.isFinite(timestamp)) {
-          continue
-        }
-
-        events.push({
-          id: `${scheduleDate}|${group}|${current.begin}|${
-            current.power ? "ON" : "OFF"
-          }`,
-          group,
-          time: current.begin,
-          power: current.power,
-          timestamp,
-          date: scheduleDate,
-        })
+      if (
+        typeof previous.power !== "boolean" ||
+        typeof current.power !== "boolean" ||
+        previous.power === current.power
+      ) {
+        continue
       }
 
-      return events
-    })
-    .filter((event) => event.timestamp > now.getTime() - 60_000)
+      // Ignore gaps in the schedule: only contiguous periods
+      // can establish a definite transition.
+      const previousEnd = parseScheduleClock(previous.end)
+      const currentBegin = parseScheduleClock(current.begin)
+
+      if (
+        previousEnd === null ||
+        currentBegin === null ||
+        previousEnd !== currentBegin
+      ) {
+        continue
+      }
+
+      const timestamp = kyivLocalDateTimeToTimestamp(
+        dateIso,
+        current.begin
+      )
+
+      if (timestamp === null) {
+        continue
+      }
+
+      const time =
+        currentBegin === 1440
+          ? "00:00"
+          : `${String(Math.floor(currentBegin / 60)).padStart(2, "0")}:${String(currentBegin % 60).padStart(2, "0")}`
+
+      groupEvents.push({
+        id: `${dateIso}|${group}|${time}|${current.power ? "ON" : "OFF"}`,
+        group,
+        time,
+        power: current.power,
+        timestamp,
+        date: dateIso,
+      })
+    }
+
+    return groupEvents
+  })
+
+  // Retain upcoming events and allow a small delay after the exact time.
+  return events.filter(
+    (event) => event.timestamp > now.getTime() - 60_000
+  )
 }
 
 async function sendSwitchingMessage(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    throw Error("Missing Telegram bot token or chat id.")
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw Error("❌ Missing telegram bot token.")
+  }
+
+  if (!TELEGRAM_CHAT_ID) {
+    throw Error("❌ Missing telegram chat id.")
   }
 
   const response = await fetch(
@@ -243,7 +385,6 @@ async function processSwitchingAlerts(
   const state = loadSwitchingState()
   const events = getSwitchingEvents(schedules, dateKey, now)
 
-  const nextByGroup = {}
   const nowMs = now.getTime()
 
   const warningWindowMs =
@@ -252,7 +393,9 @@ async function processSwitchingAlerts(
   const correctionWindowMs =
     SWITCHING_CORRECTION_WINDOW_MINUTES * 60_000
 
-  // Find the next scheduled transition for each configured group.
+  const nextByGroup = {}
+
+  // Find the next transition for every configured group.
   for (const group of TARGET_GROUPS) {
     const next = events
       .filter(
@@ -267,8 +410,7 @@ async function processSwitchingAlerts(
     }
   }
 
-  // Send a correction only if a previously tracked upcoming
-  // transition was within the next hour and its time/state changed.
+  // Notify the chat if an imminent transition has changed.
   let correctionNeeded = false
 
   for (const [group, previous] of Object.entries(
@@ -286,6 +428,7 @@ async function processSwitchingAlerts(
 
     if (!current || current.id !== previous.id) {
       correctionNeeded = true
+      break
     }
   }
 
@@ -295,77 +438,80 @@ async function processSwitchingAlerts(
     )
   }
 
-  // Warn once per transition when it is 30 minutes away or less.
   const sentWarnings = new Set(state.sentWarnings || [])
 
-  for (const event of events) {
+  // Only select reminders that are due and have not been sent before.
+  const dueEvents = events.filter((event) => {
     const minutesUntil = event.timestamp - nowMs
 
-    if (
-      minutesUntil <= 0 ||
-      minutesUntil > warningWindowMs ||
-      sentWarnings.has(event.id)
-    ) {
-      continue
-    }
-
-  const action = event.power
-    ? "увімкнення світла"
-    : "відключення світла"
-  
-  const batteryIcon = event.power ? "🔋" : "🪫"
-  
-  await sendSwitchingMessage(
-    `⏰ <b>Нагадування про перемикання ${batteryIcon}</b>\n` +
-      `Черга ${displayGroup}: ${action} о <b>${event.time}</b> (сьогодні).`
-  )
-
-    sentWarnings.add(event.id)
-  }
-
-  // Keep a bounded history so the state file does not grow forever.
-  state.sentWarnings = [...sentWarnings].slice(-500)
-
-  state.nextSwitches = Object.fromEntries(
-    Object.entries(nextByGroup).map(([group, event]) => [
-      group,
-      event,
-    ])
-  )
-
-  saveSwitchingState(state)
-}
-
-let sendNotificationRetries = 0
-let getShutdownsDataRetries = 0
-
-function loadTomorrowMessage() {
-  if (!fs.existsSync(TOMORROW_STATE_FILE)) {
-    return null
-  }
-
-  try {
-    return JSON.parse(
-      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
+    return (
+      minutesUntil > 0 &&
+      minutesUntil <= warningWindowMs &&
+      !sentWarnings.has(event.id)
     )
-  } catch (error) {
-    console.error(
-      `❌ Failed to read tomorrow state: ${error.message}`
-    )
-
-    return null
-  }
-}
-
-function saveTomorrowMessage(message) {
-  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
-    recursive: true,
   })
 
-  fs.writeFileSync(
-    TOMORROW_STATE_FILE,
-    JSON.stringify(message, null, 2)
+  // Group all due transitions that have the same exact timestamp.
+  const eventsByTime = new Map()
+
+  for (const event of dueEvents) {
+    if (!eventsByTime.has(event.timestamp)) {
+      eventsByTime.set(event.timestamp, [])
+    }
+
+    eventsByTime.get(event.timestamp).push(event)
+  }
+
+  const sortedTimes = [...eventsByTime.keys()].sort(
+    (a, b) => a - b
   )
+
+  for (const timestamp of sortedTimes) {
+    const groupedEvents = eventsByTime.get(timestamp)
+
+    // Sort by the numerical queue identifier: 2.2, 3.1, 3.2, etc.
+    groupedEvents.sort((a, b) =>
+      compareGroupNumbers(a.group, b.group)
+    )
+
+    const time = groupedEvents[0].time
+
+    const lines = groupedEvents.map((event) => {
+      const displayGroup = event.group.replace(/^GPV/i, "")
+
+      const icon = event.power ? "🔋" : "🪫"
+
+      const action = event.power
+        ? "увімкнення"
+        : "відключення"
+
+      return `${icon} Черга ${displayGroup} — ${action} світла о <b>${time}</b>`
+    })
+
+    const message = [
+      "⏰ <b>Нагадування про перемикання</b>",
+      "",
+      ...lines,
+      "",
+      "<i>(сьогодні)</i>",
+    ].join("\n")
+
+    await sendSwitchingMessage(message)
+
+    // Mark every transition in this message as sent.
+    for (const event of groupedEvents) {
+      sentWarnings.add(event.id)
+    }
+
+    console.log(
+      `🟢 Switching reminder sent for ${groupedEvents.length} group(s) at ${time}.`
+    )
+  }
+
+  state.sentWarnings = [...sentWarnings].slice(-500)
+  state.nextSwitches = nextByGroup
+
+  saveSwitchingState(state)
 }
 
 async function getShutdownsData() {
@@ -556,9 +702,7 @@ function generateMessage(
 
   const text = [
     isTomorrow
-      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel
-          .slice(8)
-          .trim()})</b> 📅`
+      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel.slice(8).trim()})</b> 📅`
       : `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
     "",
     ...sections.map(({ text }) => text),
@@ -695,7 +839,8 @@ async function sendTomorrowNotification({
     lastMessage.scheduleText !== scheduleText
 
   const isEdit =
-    Boolean(lastMessage.message_id) && isSameDate
+    Boolean(lastMessage.message_id) &&
+    isSameDate
 
   const isReply =
     Boolean(lastMessage.message_id) &&
@@ -833,7 +978,6 @@ function formatScheduleDate(dateKey) {
     console.warn(
       `⚠️ Unrecognized schedule date format: ${value}`
     )
-
     return value
   }
 
@@ -900,7 +1044,6 @@ async function run() {
     console.log(
       "🟡 Tomorrow's schedule has not been published yet."
     )
-
     return
   }
 
