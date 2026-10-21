@@ -672,14 +672,10 @@ function generateMessage(
     const scheduleLines = hasShutdowns
       ? schedule
           .filter(({ power }) => !power)
-          .map(
-            ({ begin, end }) =>
-              `🪫 <code>${begin} — ${end}</code>`
-          )
+          .map(({ begin, end }) => `🪫 ${begin} — ${end}`)
       : schedule.map(
-          ({ begin, end }) =>
-            `🔋 <code>${begin} — ${end}</code>`
-        )
+          ({ begin, end }) => `🔋 ${begin} — ${end}`
+      )
 
     return {
       group: displayGroup,
