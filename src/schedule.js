@@ -707,8 +707,8 @@ function generateMessage(
     "",
     ...sections.map(({ text }) => text),
     "",
-    `📢 <i>${update ?? "Оновлення сайту ДТЕК"}</i>`,
-    `🤖 <i>${getCurrentTime()}</i>`,
+    `🕒 <i>Останнє оновлення ДТЕК: ${update ?? "невідомо"}</i>`,
+    `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
   ].join("\n")
 
   return {
