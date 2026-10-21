@@ -41,6 +41,7 @@ const TOMORROW_STATE_FILE = path.resolve(
   "last-tomorrow-schedule.json"
 )
 
+// Стан нагадувань зберігається в гілці artifacts.
 const SWITCHING_STATE_FILE = path.resolve(
   "artifacts",
   "switching-alert-state.json"
@@ -51,34 +52,6 @@ const SWITCHING_CORRECTION_WINDOW_MINUTES = 60
 
 let sendNotificationRetries = 0
 let getShutdownsDataRetries = 0
-
-function loadTomorrowMessage() {
-  if (!fs.existsSync(TOMORROW_STATE_FILE)) {
-    return null
-  }
-
-  try {
-    return JSON.parse(
-      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
-    )
-  } catch (error) {
-    console.error(
-      `❌ Failed to read tomorrow state: ${error.message}`
-    )
-    return null
-  }
-}
-
-function saveTomorrowMessage(message) {
-  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
-    recursive: true,
-  })
-
-  fs.writeFileSync(
-    TOMORROW_STATE_FILE,
-    JSON.stringify(message, null, 2)
-  )
-}
 
 function loadSwitchingState() {
   try {
@@ -117,28 +90,35 @@ function saveSwitchingState(state) {
   )
 }
 
+function kyivDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Kyiv",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date)
+
+  return Object.fromEntries(
+    parts.map(({ type, value }) => [type, value])
+  )
+}
+
 function parseScheduleClock(value) {
   const match = String(value ?? "").match(/^(\d{1,2}):(\d{2})$/)
 
-  if (!match) {
-    return null
-  }
+  if (!match) return null
 
   const hour = Number(match[1])
   const minute = Number(match[2])
 
-  if (
-    minute < 0 ||
-    minute > 59 ||
-    hour < 0 ||
-    hour > 24
-  ) {
+  if (hour < 0 || hour > 24 || minute < 0 || minute > 59) {
     return null
   }
 
-  if (hour === 24 && minute !== 0) {
-    return null
-  }
+  if (hour === 24 && minute !== 0) return null
 
   return hour * 60 + minute
 }
@@ -161,19 +141,9 @@ function formatScheduleDateIso(dateKey) {
 
   if (/^\d{10}$/.test(value)) {
     const date = new Date(Number(value) * 1000)
+    const parts = kyivDateParts(date)
 
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Europe/Kyiv",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).formatToParts(date)
-
-    const values = Object.fromEntries(
-      parts.map(({ type, value }) => [type, value])
-    )
-
-    return `${values.year}-${values.month}-${values.day}`
+    return `${parts.year}-${parts.month}-${parts.day}`
   }
 
   return null
@@ -182,9 +152,7 @@ function formatScheduleDateIso(dateKey) {
 function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
   const minutes = parseScheduleClock(clockValue)
 
-  if (minutes === null || !dateIso) {
-    return null
-  }
+  if (minutes === null || !dateIso) return null
 
   const [year, month, day] = dateIso.split("-").map(Number)
 
@@ -201,7 +169,8 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
     minute
   )
 
-  // Determine Kyiv's actual UTC offset using its IANA time zone.
+  // Визначаємо фактичний UTC offset для Europe/Kyiv,
+  // ураховуючи перехід на літній і зимовий час.
   let timestamp = targetUtcLike
 
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -231,50 +200,23 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
 
     timestamp += difference
 
-    if (difference === 0) {
-      break
-    }
+    if (difference === 0) break
   }
 
   return timestamp
 }
 
-function compareGroupNumbers(groupA, groupB) {
-  const partsA = groupA
-    .replace(/^GPV/i, "")
-    .split(".")
-    .map(Number)
-
-  const partsB = groupB
-    .replace(/^GPV/i, "")
-    .split(".")
-    .map(Number)
-
-  const length = Math.max(partsA.length, partsB.length)
-
-  for (let index = 0; index < length; index++) {
-    const a = partsA[index] ?? 0
-    const b = partsB[index] ?? 0
-
-    if (a !== b) {
-      return a - b
-    }
-  }
-
-  return 0
-}
-
 function getSwitchingEvents(schedules, dateKey, now = new Date()) {
-  const dateIso = formatScheduleDateIso(dateKey)
+  const scheduleDate = formatScheduleDateIso(dateKey)
 
-  if (!dateIso) {
+  if (!scheduleDate) {
     console.warn(
       `⚠️ Cannot parse schedule date for switching alerts: ${dateKey}`
     )
     return []
   }
 
-  const events = schedules.flatMap(({ group, schedule }) => {
+  return schedules.flatMap(({ group, schedule }) => {
     const sorted = [...schedule].sort(
       (a, b) =>
         (parseScheduleClock(a.begin) ?? -1) -
@@ -295,11 +237,10 @@ function getSwitchingEvents(schedules, dateKey, now = new Date()) {
         continue
       }
 
-      // Ignore gaps in the schedule: only contiguous periods
-      // can establish a definite transition.
       const previousEnd = parseScheduleClock(previous.end)
       const currentBegin = parseScheduleClock(current.begin)
 
+      // Вважаємо це перемиканням лише тоді, коли періоди суміжні.
       if (
         previousEnd === null ||
         currentBegin === null ||
@@ -309,11 +250,11 @@ function getSwitchingEvents(schedules, dateKey, now = new Date()) {
       }
 
       const timestamp = kyivLocalDateTimeToTimestamp(
-        dateIso,
+        scheduleDate,
         current.begin
       )
 
-      if (timestamp === null) {
+      if (timestamp === null || !Number.isFinite(timestamp)) {
         continue
       }
 
@@ -323,31 +264,49 @@ function getSwitchingEvents(schedules, dateKey, now = new Date()) {
           : `${String(Math.floor(currentBegin / 60)).padStart(2, "0")}:${String(currentBegin % 60).padStart(2, "0")}`
 
       groupEvents.push({
-        id: `${dateIso}|${group}|${time}|${current.power ? "ON" : "OFF"}`,
+        id: `${scheduleDate}|${group}|${time}|${current.power ? "ON" : "OFF"}`,
         group,
         time,
         power: current.power,
         timestamp,
-        date: dateIso,
+        date: scheduleDate,
       })
     }
 
     return groupEvents
-  })
+  }).filter((event) => event.timestamp > now.getTime() - 60_000)
+}
 
-  // Retain upcoming events and allow a small delay after the exact time.
-  return events.filter(
-    (event) => event.timestamp > now.getTime() - 60_000
-  )
+function compareGroupNumbers(groupA, groupB) {
+  const partsA = groupA
+    .replace(/^GPV/i, "")
+    .split(".")
+    .map(Number)
+
+  const partsB = groupB
+    .replace(/^GPV/i, "")
+    .split(".")
+    .map(Number)
+
+  const length = Math.max(partsA.length, partsB.length)
+
+  for (let index = 0; index < length; index++) {
+    const a = partsA[index] ?? 0
+    const b = partsB[index] ?? 0
+
+    if (a !== b) return a - b
+  }
+
+  return 0
 }
 
 async function sendSwitchingMessage(text) {
   if (!TELEGRAM_BOT_TOKEN) {
-    throw Error("❌ Missing telegram bot token.")
+    throw Error("Missing Telegram bot token.")
   }
 
   if (!TELEGRAM_CHAT_ID) {
-    throw Error("❌ Missing telegram chat id.")
+    throw Error("Missing Telegram chat id.")
   }
 
   const response = await fetch(
@@ -384,7 +343,6 @@ async function processSwitchingAlerts(
 ) {
   const state = loadSwitchingState()
   const events = getSwitchingEvents(schedules, dateKey, now)
-
   const nowMs = now.getTime()
 
   const warningWindowMs =
@@ -395,7 +353,6 @@ async function processSwitchingAlerts(
 
   const nextByGroup = {}
 
-  // Find the next transition for every configured group.
   for (const group of TARGET_GROUPS) {
     const next = events
       .filter(
@@ -410,7 +367,8 @@ async function processSwitchingAlerts(
     }
   }
 
-  // Notify the chat if an imminent transition has changed.
+  // Повідомляємо про зміну часу найближчого перемикання,
+  // якщо попередній час був у межах найближчої години.
   let correctionNeeded = false
 
   for (const [group, previous] of Object.entries(
@@ -434,13 +392,12 @@ async function processSwitchingAlerts(
 
   if (correctionNeeded) {
     await sendSwitchingMessage(
-      "⚠️ <b>Графік ДТЕК змінився. Час наступного перемикання черг оновлено.</b>"
+      "⚠️ <b>Графік ДТЕК змінився.</b> Час наступного перемикання черг оновлено."
     )
   }
 
   const sentWarnings = new Set(state.sentWarnings || [])
 
-  // Only select reminders that are due and have not been sent before.
   const dueEvents = events.filter((event) => {
     const minutesUntil = event.timestamp - nowMs
 
@@ -451,7 +408,7 @@ async function processSwitchingAlerts(
     )
   })
 
-  // Group all due transitions that have the same exact timestamp.
+  // Групуємо одночасні перемикання, щоб надіслати одне повідомлення.
   const eventsByTime = new Map()
 
   for (const event of dueEvents) {
@@ -462,14 +419,13 @@ async function processSwitchingAlerts(
     eventsByTime.get(event.timestamp).push(event)
   }
 
-  const sortedTimes = [...eventsByTime.keys()].sort(
+  const timestamps = [...eventsByTime.keys()].sort(
     (a, b) => a - b
   )
 
-  for (const timestamp of sortedTimes) {
+  for (const timestamp of timestamps) {
     const groupedEvents = eventsByTime.get(timestamp)
 
-    // Sort by the numerical queue identifier: 2.2, 3.1, 3.2, etc.
     groupedEvents.sort((a, b) =>
       compareGroupNumbers(a.group, b.group)
     )
@@ -478,40 +434,60 @@ async function processSwitchingAlerts(
 
     const lines = groupedEvents.map((event) => {
       const displayGroup = event.group.replace(/^GPV/i, "")
-
       const icon = event.power ? "🔋" : "🪫"
-
-      const action = event.power
-        ? "увімкнення"
-        : "відключення"
+      const action = event.power ? "увімкнення" : "відключення"
 
       return `${icon} Черга ${displayGroup} — ${action} світла о <b>${time}</b>`
     })
 
-    const message = [
-      "⏰ <b>Нагадування про перемикання</b>",
-      "",
-      ...lines,
-      "",
-      "<i>(сьогодні)</i>",
-    ].join("\n")
+    await sendSwitchingMessage(
+      [
+        "⏰ <b>Нагадування про перемикання</b>",
+        "",
+        ...lines,
+        "",
+        "<i>(сьогодні)</i>",
+      ].join("\n")
+    )
 
-    await sendSwitchingMessage(message)
-
-    // Mark every transition in this message as sent.
     for (const event of groupedEvents) {
       sentWarnings.add(event.id)
     }
-
-    console.log(
-      `🟢 Switching reminder sent for ${groupedEvents.length} group(s) at ${time}.`
-    )
   }
 
   state.sentWarnings = [...sentWarnings].slice(-500)
   state.nextSwitches = nextByGroup
 
   saveSwitchingState(state)
+}
+
+function loadTomorrowMessage() {
+  if (!fs.existsSync(TOMORROW_STATE_FILE)) {
+    return null
+  }
+
+  try {
+    return JSON.parse(
+      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
+    )
+  } catch (error) {
+    console.error(
+      `❌ Failed to read tomorrow state: ${error.message}`
+    )
+
+    return null
+  }
+}
+
+function saveTomorrowMessage(message) {
+  fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
+    recursive: true,
+  })
+
+  fs.writeFileSync(
+    TOMORROW_STATE_FILE,
+    JSON.stringify(message, null, 2)
+  )
 }
 
 async function getShutdownsData() {
@@ -522,22 +498,86 @@ async function getShutdownsData() {
   try {
     browser = await chromium.launch({ headless: true })
 
-    const browserPage = await browser.newPage()
+    const browserPage = await browser.newPage({
+      locale: "uk-UA",
+      timezoneId: "Europe/Kyiv",
+    })
 
     await browserPage.goto(SHUTDOWNS_PAGE, {
       waitUntil: "load",
     })
 
+    // ДІАГНОСТИКА: шукаємо в тексті сторінки згадки про аварійні
+    // та екстрені відключення. На роботу бота цей блок не впливає.
+    const pageText = await browserPage.locator("body").innerText()
+    const normalizedText = pageText.replace(/\u00a0/g, " ")
+
+    const keywords = [
+      /аварійн[а-яіїєґ\s-]{0,50}відключ/giu,
+      /екстрен[а-яіїєґ\s-]{0,50}відключ/giu,
+      /графік[а-яіїєґ\s-]{0,40}не діють/giu,
+      /графік[а-яіїєґ\s-]{0,40}не застосов/giu,
+    ]
+
+    const diagnosticSnippets = new Set()
+
+    for (const pattern of keywords) {
+      for (const match of normalizedText.matchAll(pattern)) {
+        const start = Math.max(0, match.index - 220)
+
+        const end = Math.min(
+          normalizedText.length,
+          match.index + match[0].length + 320
+        )
+
+        diagnosticSnippets.add(
+          normalizedText
+            .slice(start, end)
+            .replace(/\n{3,}/g, "\n\n")
+            .trim()
+        )
+      }
+    }
+
+    console.log(
+      "[DIAGNOSTIC] Current-page outage-related text snippets:"
+    )
+
+    if (diagnosticSnippets.size) {
+      let index = 0
+
+      for (const snippet of diagnosticSnippets) {
+        index++
+
+        console.log(
+          `[DIAGNOSTIC] Snippet ${index}: ${JSON.stringify(snippet)}`
+        )
+      }
+    } else {
+      console.log(
+        "[DIAGNOSTIC] No outage-related keywords found in visible page text."
+      )
+    }
+
     const html = await browserPage.content()
     const match = html.match(SHUTDOWNS_DATA_MATCHER)
 
     if (!match) {
-      throw new Error(
-        "Shutdowns data not found in page HTML"
-      )
+      throw new Error("Shutdowns data not found in page HTML")
     }
 
     const result = JSON.parse(match[1])
+
+    // ДІАГНОСТИКА: перевіряємо, чи містить JSON дані про черги
+    // окремий статус аварійного або екстреного відключення.
+    const todayGroupData = result.data?.[result.today] ?? {}
+
+    for (const group of TARGET_GROUPS) {
+      console.log(
+        `[DIAGNOSTIC] Raw data for ${group}:`,
+        JSON.stringify(todayGroupData[group] ?? null).slice(0, 1500)
+      )
+    }
 
     console.log("✅ Getting shutdowns data finished.")
 
@@ -663,7 +703,7 @@ function generateMessage(
   console.log("🌀 Generating message...")
 
   const sections = schedules.map(({ group, schedule }) => {
-    const displayGroup = group.replace("GPV", "")
+    const displayGroup = group.replace(/^GPV/i, "")
 
     const hasShutdowns = schedule.some(
       ({ power }) => !power
@@ -675,7 +715,7 @@ function generateMessage(
           .map(({ begin, end }) => `🪫 ${begin} — ${end}`)
       : schedule.map(
           ({ begin, end }) => `🔋 ${begin} — ${end}`
-      )
+        )
 
     return {
       group: displayGroup,
@@ -835,8 +875,7 @@ async function sendTomorrowNotification({
     lastMessage.scheduleText !== scheduleText
 
   const isEdit =
-    Boolean(lastMessage.message_id) &&
-    isSameDate
+    Boolean(lastMessage.message_id) && isSameDate
 
   const isReply =
     Boolean(lastMessage.message_id) &&
@@ -948,7 +987,6 @@ function getAvailableSchedules(data, date) {
 function formatScheduleDate(dateKey) {
   const value = String(dateKey).trim()
 
-  // Unix timestamp in seconds.
   if (/^\d{10}$/.test(value)) {
     const date = new Date(Number(value) * 1000)
 
@@ -1005,8 +1043,8 @@ async function run() {
       text: [
         "⚠️ <b>Графік відключень на сьогодні ще не опублікований.</b>",
         "",
-        `📢 <i>${result.update ?? "Дані ДТЕК"}</i>`,
-        `🤖 <i>Перевірено: ${getCurrentTime()}</i>`,
+        `🕒 <i>Останнє оновлення ДТЕК: ${result.update ?? "невідомо"}</i>`,
+        `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
       ].join("\n"),
       scheduleText: "NO_SCHEDULE",
     })
