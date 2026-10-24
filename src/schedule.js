@@ -171,6 +171,8 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
     minute
   )
 
+  // Визначаємо фактичний UTC offset для Europe/Kyiv.
+  // Це враховує перехід між літнім і зимовим часом.
   let timestamp = targetUtcLike
 
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -239,6 +241,7 @@ function getSwitchingEvents(schedules, dateKey, now = new Date()) {
       const previousEnd = parseScheduleClock(previous.end)
       const currentBegin = parseScheduleClock(current.begin)
 
+      // Періоди мають бути суміжними, щоб визначати перемикання.
       if (
         previousEnd === null ||
         currentBegin === null ||
@@ -398,6 +401,7 @@ async function processSwitchingAlerts(
     )
   })
 
+  // Групуємо події за точним часом перемикання.
   const eventsByTime = new Map()
 
   for (const event of dueEvents) {
@@ -479,6 +483,8 @@ function saveTomorrowMessage(message) {
   )
 }
 
+// Читаємо тільки блок поточного повідомлення над формою пошуку адреси.
+// Не скануємо всю сторінку, щоб не сплутати актуальний статус із FAQ.
 function extractCurrentNotice(pageText) {
   const text = String(pageText ?? "").replace(/\u00a0/g, " ")
   const startMatch = /Шановні клієнти!\s*/iu.exec(text)
@@ -521,6 +527,8 @@ function detectOutageMode(noticeText) {
   const emergencyExplicitlyIntroduced =
     /(?:введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*|застосован[а-яіїєґ]*|оголошен[а-яіїєґ]*|діють)[^.!?]{0,100}екстрен[а-яіїєґ]*\s+відключ/iu.test(text)
 
+  // Згадка "уникнути екстрених відключень" не означає,
+  // що екстрені відключення вже введено.
   if (
     emergencyExplicitlyIntroduced ||
     (mentionsEmergency && schedulesInactive)
@@ -559,8 +567,6 @@ function getOutageModeBanner(mode) {
       "🚨 <b>Екстрені відключення. Планові графіки можуть не діяти.</b>",
     accident:
       "⚠️ <b>Аварійні відключення. Планові графіки можуть не діяти.</b>",
-    unknown:
-      "⚠️ <b>Не вдалося визначити актуальний статус повідомлення ДТЕК.</b> Графік нижче отримано із сайту, але його актуальність під час можливих аварійних/екстрених відключень не підтверджена.",
   }
 
   return messages[mode] ?? ""
@@ -606,6 +612,8 @@ async function getShutdownsData() {
     const html = await browserPage.content()
     const match = html.match(SHUTDOWNS_DATA_MATCHER)
 
+    // Якщо є підтверджене попередження, його можна показати,
+    // навіть коли JSON погодинного графіка тимчасово недоступний.
     if (!match) {
       if (
         outageStatus.mode === "emergency" ||
@@ -629,6 +637,7 @@ async function getShutdownsData() {
 
     const result = JSON.parse(match[1])
 
+    // Діагностика сирих даних черг.
     const todayGroupData = result.data?.[result.today] ?? {}
 
     for (const group of TARGET_GROUPS) {
@@ -810,6 +819,28 @@ async function sendNotification({ text, scheduleText }) {
   console.log("🌀 Sending today's notification...")
 
   const lastMessage = loadLastMessage() || {}
+
+  const previousScheduleText = String(
+    lastMessage.scheduleText ?? ""
+  )
+
+  const wasConfirmedOutageMode =
+    previousScheduleText.startsWith("MODE:emergency|") ||
+    previousScheduleText.startsWith("MODE:accident|") ||
+    previousScheduleText === "OUTAGE_MODE:emergency" ||
+    previousScheduleText === "OUTAGE_MODE:accident"
+
+  const isNowOutageMode =
+    String(scheduleText).startsWith("MODE:emergency|") ||
+    String(scheduleText).startsWith("MODE:accident|")
+
+  if (wasConfirmedOutageMode && !isNowOutageMode) {
+    text = [
+      "✅ <b>Сайт ДТЕК більше не показує активне повідомлення про аварійні або екстрені відключення.</b>",
+      "",
+      text,
+    ].join("\n")
+  }
 
   const isScheduleChanged =
     lastMessage.scheduleText !== scheduleText
@@ -1057,10 +1088,18 @@ async function run() {
   console.log("Configured groups:", TARGET_GROUPS)
 
   const result = await getShutdownsData()
-  const outageMode = result.outageMode ?? "unknown"
+
+  // Якщо статус не вдалося визначити, працюємо у звичайному режимі.
+  // Попередження показуємо лише для підтверджених аварійних/екстрених станів.
+  const detectedMode = result.outageMode ?? "unknown"
+  const outageMode =
+    detectedMode === "emergency" || detectedMode === "accident"
+      ? detectedMode
+      : "normal"
 
   console.log("Today:", result.today)
-  console.log("Detected outage mode:", outageMode)
+  console.log("Detected outage mode:", detectedMode)
+  console.log("Mode used by bot:", outageMode)
 
   const data = result.data ?? {}
   const dates = Object.keys(data).sort()
@@ -1082,6 +1121,7 @@ async function run() {
       scheduleText: `MODE:${outageMode}|${todayMessage.scheduleText}`,
     })
 
+    // Нагадування працюють також під час аварійних/екстрених відключень.
     await processSwitchingAlerts(todaySchedules, today)
   } else {
     console.log("🔋 No schedule data found for today.")
@@ -1114,6 +1154,7 @@ async function run() {
   }
 
   const formattedTomorrow = formatScheduleDate(tomorrow)
+
   const tomorrowMessage = generateMessage(
     tomorrowSchedules,
     result.update,
