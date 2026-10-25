@@ -383,11 +383,9 @@ async function processSwitchingAlerts(
     }
   }
 
-  if (correctionNeeded) {
-    await sendSwitchingMessage(
-      "⚠️ <b>Графік ДТЕК змінився.</b> Час наступного перемикання черг оновлено."
-    )
-  }
+  // Не надсилаємо окреме повідомлення про зміну графіка.
+  // Повертаємо прапорець, щоб попередження додалося першим рядком
+  // до основного повідомлення з оновленим графіком.
 
   const sentWarnings = new Set(state.sentWarnings || [])
 
@@ -452,6 +450,7 @@ async function processSwitchingAlerts(
   state.nextSwitches = nextByGroup
 
   saveSwitchingState(state)
+  return correctionNeeded
 }
 
 function loadTomorrowMessage() {
@@ -1116,13 +1115,25 @@ async function run() {
       "сьогодні"
     )
 
+    // Перевіряємо зміни часу перемикання до надсилання основного повідомлення,
+    // щоб попередження було першим рядком у ньому, а не окремим повідомленням.
+    const switchingScheduleChanged = await processSwitchingAlerts(
+      todaySchedules,
+      today,
+    )
+
+    const notificationText = switchingScheduleChanged
+      ? [
+          "⚠️ <b>Графік ДТЕК змінився.</b> Час наступного перемикання черг оновлено.",
+          "",
+          addOutageBanner(todayMessage.text, outageMode),
+        ].join("\n")
+      : addOutageBanner(todayMessage.text, outageMode)
+
     await sendNotification({
-      text: addOutageBanner(todayMessage.text, outageMode),
+      text: notificationText,
       scheduleText: `MODE:${outageMode}|${todayMessage.scheduleText}`,
     })
-
-    // Нагадування працюють також під час аварійних/екстрених відключень.
-    await processSwitchingAlerts(todaySchedules, today)
   } else {
     console.log("🔋 No schedule data found for today.")
 
