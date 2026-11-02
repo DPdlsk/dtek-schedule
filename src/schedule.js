@@ -576,64 +576,136 @@ function addOutageBanner(text, mode) {
   return banner ? `${banner}\n\n${text}` : text
 }
 
-async function getShutdownsData() {
-  console.log("🌀 Getting shutdowns data...")
 
-  let browser
-
-  try {
-    browser = await chromium.launch({ headless: true })
-
-    const browserPage = await browser.newPage({
-      locale: "uk-UA",
-      timezoneId: "Europe/Kyiv",
-    })
-
-    await browserPage.goto(SHUTDOWNS_PAGE, {
-      waitUntil: "load",
-    })
-
-    const pageText = await browserPage.locator("body").innerText()
-    const noticeText = extractCurrentNotice(pageText)
-    const outageStatus = detectOutageMode(noticeText)
-
-    console.log(
-      `[OUTAGE STATUS] ${outageStatus.mode}: ${outageStatus.reason}`
-    )
-
-    console.log(
-      "[OUTAGE NOTICE]",
-      noticeText
-        ? JSON.stringify(noticeText)
-        : "(current notice not found)"
-    )
-
-    const html = await browserPage.content()
-    const match = html.match(SHUTDOWNS_DATA_MATCHER)
-
-    // Якщо є підтверджене попередження, його можна показати,
-    // навіть коли JSON погодинного графіка тимчасово недоступний.
-    if (!match) {
-      if (
-        outageStatus.mode === "emergency" ||
-        outageStatus.mode === "accident"
-      ) {
-        console.warn(
-          "⚠️ Schedule JSON is unavailable, but an active outage notice was detected."
-        )
-
-        return {
-          today: null,
-          data: {},
-          update: null,
-          outageMode: outageStatus.mode,
-          outageNotice: noticeText,
+  async function getShutdownsData() {
+    console.log("🌀 Getting shutdowns data...")
+  
+    let browser
+  
+    try {
+      browser = await chromium.launch({ headless: true })
+  
+      const browserPage = await browser.newPage({
+        locale: "uk-UA",
+        timezoneId: "Europe/Kyiv",
+      })
+  
+      const response = await browserPage.goto(SHUTDOWNS_PAGE, {
+        waitUntil: "load",
+        timeout: 30000,
+      })
+  
+      // Діагностика відповіді сайту
+      console.log("[DIAGNOSTIC] Requested URL:", SHUTDOWNS_PAGE)
+      console.log("[DIAGNOSTIC] Final URL:", browserPage.url())
+      console.log("[DIAGNOSTIC] HTTP status:", response?.status())
+      console.log(
+        "[DIAGNOSTIC] Content-Type:",
+        response?.headers()["content-type"]
+      )
+      console.log("[DIAGNOSTIC] Title:", await browserPage.title())
+  
+      const pageText = await browserPage.locator("body").innerText()
+  
+      console.log(
+        "[DIAGNOSTIC] Page text:",
+        JSON.stringify(pageText.slice(0, 2500))
+      )
+  
+      const html = await browserPage.content()
+  
+      console.log("[DIAGNOSTIC] HTML length:", html.length)
+      console.log(
+        "[DIAGNOSTIC] HTML beginning:",
+        JSON.stringify(html.slice(0, 2000))
+      )
+  
+      // Визначення актуального повідомлення ДТЕК
+      const noticeText = extractCurrentNotice(pageText)
+      const outageStatus = detectOutageMode(noticeText)
+  
+      console.log(
+        `[OUTAGE STATUS] ${outageStatus.mode}: ${outageStatus.reason}`
+      )
+  
+      console.log(
+        "[OUTAGE NOTICE]",
+        noticeText
+          ? JSON.stringify(noticeText)
+          : "(current notice not found)"
+      )
+  
+      // Пошук даних графіків у HTML
+      const match = html.match(SHUTDOWNS_DATA_MATCHER)
+  
+      // Якщо є підтверджене попередження, його можна показати,
+      // навіть коли JSON погодинного графіка тимчасово недоступний.
+      if (!match) {
+        if (
+          outageStatus.mode === "emergency" ||
+          outageStatus.mode === "accident"
+        ) {
+          console.warn(
+            "⚠️ Schedule JSON is unavailable, but an active outage notice was detected."
+          )
+  
+          return {
+            today: null,
+            data: {},
+            update: null,
+            outageMode: outageStatus.mode,
+            outageNotice: noticeText,
+          }
         }
+  
+        throw new Error("Shutdowns data not found in page HTML")
       }
-
-      throw new Error("Shutdowns data not found in page HTML")
+  
+      const result = JSON.parse(match[1])
+  
+      // Діагностика сирих даних черг.
+      const todayGroupData = result.data?.[result.today] ?? {}
+  
+      for (const group of TARGET_GROUPS) {
+        console.log(
+          `[DIAGNOSTIC] Raw data for ${group}:`,
+          JSON.stringify(todayGroupData[group] ?? null).slice(0, 1500)
+        )
+      }
+  
+      console.log("✅ Getting shutdowns data finished.")
+  
+      return {
+        ...result,
+        outageMode: outageStatus.mode,
+        outageNotice: noticeText,
+      }
+    } catch (error) {
+      console.error(
+        `❌ Getting shutdowns data failed: ${error.message}.`
+      )
+    } finally {
+      if (browser) {
+        await browser.close()
+      }
     }
-
+  
+    if (getShutdownsDataRetries < RETRIES_MAX_COUNT) {
+      getShutdownsDataRetries++
+  
+      console.log("🌀 Try getting shutdowns data again...")
+  
+      await new Promise((resolve) =>
+        setTimeout(resolve, RETRIES_TIMEOUT)
+      )
+  
+      return await getShutdownsData()
+    }
+  
+    throw Error(
+      `❌ Getting shutdowns data failed after ${RETRIES_MAX_COUNT} retries.`
+    )
+  }
     const result = JSON.parse(match[1])
 
     // Діагностика сирих даних черг.
