@@ -172,6 +172,7 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
   )
 
   // Визначаємо фактичний UTC offset для Europe/Kyiv.
+  // Це враховує перехід між літнім і зимовим часом.
   let timestamp = targetUtcLike
 
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -382,11 +383,9 @@ async function processSwitchingAlerts(
     }
   }
 
-  if (correctionNeeded) {
-    await sendSwitchingMessage(
-      "⚠️ <b>Графік ДТЕК змінився.</b> Час наступного перемикання черг оновлено."
-    )
-  }
+  // Не надсилаємо окреме повідомлення про зміну графіка.
+  // Повертаємо прапорець, щоб попередження додалося першим рядком
+  // до основного повідомлення з оновленим графіком.
 
   const sentWarnings = new Set(state.sentWarnings || [])
 
@@ -451,6 +450,7 @@ async function processSwitchingAlerts(
   state.nextSwitches = nextByGroup
 
   saveSwitchingState(state)
+  return correctionNeeded
 }
 
 function loadTomorrowMessage() {
@@ -560,28 +560,20 @@ function detectOutageMode(noticeText) {
   }
 }
 
-function getOutageModeMessage(mode, update) {
+function getOutageModeBanner(mode) {
   const messages = {
     emergency:
-      "🚨 <b>Екстрені відключення. Планові графіки не діють.</b>",
+      "🚨 <b>Екстрені відключення. Планові графіки можуть не діяти.</b>",
     accident:
-      "⚠️ <b>Аварійні відключення. Планові графіки не діють.</b>",
-    unknown:
-      "⚠️ <b>Не вдалося визначити актуальний статус графіків ДТЕК.</b>\nПланові нагадування тимчасово призупинено, доки бот не зможе перевірити повідомлення сайту.",
+      "⚠️ <b>Аварійні відключення. Планові графіки можуть не діяти.</b>",
   }
 
-  return [
-    messages[mode] ?? messages.unknown,
-    "",
-    `🕒 <i>Останнє оновлення ДТЕК: ${update ?? "невідомо"}</i>`,
-    `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
-  ].join("\n")
+  return messages[mode] ?? ""
 }
 
-function pauseSwitchingAlerts() {
-  const state = loadSwitchingState()
-  state.nextSwitches = {}
-  saveSwitchingState(state)
+function addOutageBanner(text, mode) {
+  const banner = getOutageModeBanner(mode)
+  return banner ? `${banner}\n\n${text}` : text
 }
 
 async function getShutdownsData() {
@@ -597,37 +589,11 @@ async function getShutdownsData() {
       timezoneId: "Europe/Kyiv",
     })
 
-    const response = await browserPage.goto(SHUTDOWNS_PAGE, {
+    await browserPage.goto(SHUTDOWNS_PAGE, {
       waitUntil: "load",
-      timeout: 30000,
     })
 
-    // Діагностика відповіді сайту
-    console.log("[DIAGNOSTIC] Requested URL:", SHUTDOWNS_PAGE)
-    console.log("[DIAGNOSTIC] Final URL:", browserPage.url())
-    console.log("[DIAGNOSTIC] HTTP status:", response?.status())
-    console.log(
-      "[DIAGNOSTIC] Content-Type:",
-      response?.headers()["content-type"]
-    )
-    console.log("[DIAGNOSTIC] Title:", await browserPage.title())
-
     const pageText = await browserPage.locator("body").innerText()
-
-    console.log(
-      "[DIAGNOSTIC] Page text:",
-      JSON.stringify(pageText.slice(0, 2500))
-    )
-
-    const html = await browserPage.content()
-
-    console.log("[DIAGNOSTIC] HTML length:", html.length)
-    console.log(
-      "[DIAGNOSTIC] HTML beginning:",
-      JSON.stringify(html.slice(0, 2000))
-    )
-
-    // Визначення актуального повідомлення ДТЕК
     const noticeText = extractCurrentNotice(pageText)
     const outageStatus = detectOutageMode(noticeText)
 
@@ -642,7 +608,7 @@ async function getShutdownsData() {
         : "(current notice not found)"
     )
 
-    // Пошук даних графіків у HTML
+    const html = await browserPage.content()
     const match = html.match(SHUTDOWNS_DATA_MATCHER)
 
     // Якщо є підтверджене попередження, його можна показати,
@@ -858,12 +824,14 @@ async function sendNotification({ text, scheduleText }) {
   )
 
   const wasConfirmedOutageMode =
+    previousScheduleText.startsWith("MODE:emergency|") ||
+    previousScheduleText.startsWith("MODE:accident|") ||
     previousScheduleText === "OUTAGE_MODE:emergency" ||
     previousScheduleText === "OUTAGE_MODE:accident"
 
-  const isNowOutageMode = String(scheduleText).startsWith(
-    "OUTAGE_MODE:"
-  )
+  const isNowOutageMode =
+    String(scheduleText).startsWith("MODE:emergency|") ||
+    String(scheduleText).startsWith("MODE:accident|")
 
   if (wasConfirmedOutageMode && !isNowOutageMode) {
     text = [
@@ -1120,65 +1088,67 @@ async function run() {
 
   const result = await getShutdownsData()
 
+  // Якщо статус не вдалося визначити, працюємо у звичайному режимі.
+  // Попередження показуємо лише для підтверджених аварійних/екстрених станів.
+  const detectedMode = result.outageMode ?? "unknown"
+  const outageMode =
+    detectedMode === "emergency" || detectedMode === "accident"
+      ? detectedMode
+      : "normal"
+
   console.log("Today:", result.today)
-  console.log("Detected outage mode:", result.outageMode)
+  console.log("Detected outage mode:", detectedMode)
+  console.log("Mode used by bot:", outageMode)
 
-  // Якщо є активний або невизначений статус, не публікуємо
-  // звичайний графік і не надсилаємо планові нагадування.
-  if (result.outageMode !== "normal") {
-    await sendNotification({
-      text: getOutageModeMessage(
-        result.outageMode,
-        result.update
-      ),
-      scheduleText: `OUTAGE_MODE:${result.outageMode}`,
-    })
-
-    pauseSwitchingAlerts()
-
-    console.log(
-      `⚠️ Plan schedule and switching alerts paused: ${result.outageMode}`
-    )
-
-    return
-  }
-
-  const dates = Object.keys(result.data ?? {}).sort()
+  const data = result.data ?? {}
+  const dates = Object.keys(data).sort()
+  const today = result.today
 
   console.log("Available dates:", dates)
 
-  const today = result.today
+  const todaySchedules = getAvailableSchedules(data, today)
 
-  const todaySchedules = getAvailableSchedules(
-    result.data ?? {},
-    today
-  )
-
-  if (!todaySchedules) {
-    console.log("🔋 No schedule data found for today.")
-
-    await sendNotification({
-      text: [
-        "⚠️ <b>Графік відключень на сьогодні ще не опублікований.</b>",
-        "",
-        `🕒 <i>Останнє оновлення ДТЕК: ${result.update ?? "невідомо"}</i>`,
-        `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
-      ].join("\n"),
-      scheduleText: "NO_SCHEDULE",
-    })
-
-    return
-  }
-
-  await sendNotification(
-    generateMessage(
+  if (todaySchedules) {
+    const todayMessage = generateMessage(
       todaySchedules,
       result.update,
       "сьогодні"
     )
-  )
 
-  await processSwitchingAlerts(todaySchedules, today)
+    // Перевіряємо зміни часу перемикання до надсилання основного повідомлення,
+    // щоб попередження було першим рядком у ньому, а не окремим повідомленням.
+    const switchingScheduleChanged = await processSwitchingAlerts(
+      todaySchedules,
+      today,
+    )
+
+    const notificationText = switchingScheduleChanged
+      ? [
+          "⚠️ <b>Графік ДТЕК змінився.</b> Час наступного перемикання черг оновлено.",
+          "",
+          addOutageBanner(todayMessage.text, outageMode),
+        ].join("\n")
+      : addOutageBanner(todayMessage.text, outageMode)
+
+    await sendNotification({
+      text: notificationText,
+      scheduleText: `MODE:${outageMode}|${todayMessage.scheduleText}`,
+    })
+  } else {
+    console.log("🔋 No schedule data found for today.")
+
+    const noScheduleText = [
+      "⚠️ <b>Графік відключень на сьогодні ще не опублікований або недоступний.</b>",
+      "",
+      `🕒 <i>Останнє оновлення ДТЕК: ${result.update ?? "невідомо"}</i>`,
+      `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
+    ].join("\n")
+
+    await sendNotification({
+      text: addOutageBanner(noScheduleText, outageMode),
+      scheduleText: `MODE:${outageMode}|NO_SCHEDULE`,
+    })
+  }
 
   const tomorrow = dates.find((date) => date > today)
 
@@ -1187,15 +1157,10 @@ async function run() {
     return
   }
 
-  const tomorrowSchedules = getAvailableSchedules(
-    result.data ?? {},
-    tomorrow
-  )
+  const tomorrowSchedules = getAvailableSchedules(data, tomorrow)
 
   if (!tomorrowSchedules) {
-    console.log(
-      "🟡 Tomorrow's schedule has not been published yet."
-    )
+    console.log("🟡 Tomorrow's schedule has not been published yet.")
     return
   }
 
@@ -1208,7 +1173,8 @@ async function run() {
   )
 
   await sendTomorrowNotification({
-    ...tomorrowMessage,
+    text: addOutageBanner(tomorrowMessage.text, outageMode),
+    scheduleText: `MODE:${outageMode}|${tomorrowMessage.scheduleText}`,
     scheduleDate: tomorrow,
   })
 }
