@@ -1129,8 +1129,8 @@ async function run() {
   );
 
   await sendTomorrowNotification({
-    text: addOutageBanner(tomorrowMessage.text, outageMode),
-    scheduleText: `MODE:${outageMode}|${tomorrowMessage.scheduleText}`,
+    text: tomorrowMessage.text,
+    scheduleText: tomorrowMessage.scheduleText,
     scheduleDate: tomorrow,
   });
 }
