@@ -556,26 +556,19 @@ async function getShutdownsData() {
       timeout: 45000,
     });
 
-    // ДТЕК іноді спочатку повертає сторінку очікування Incapsula.
-    // Вона може автоматично перейти до справжньої сторінки пізніше.
-    // Чекаємо на JSON графіків або на основний блок сторінки.
-    await browserPage
-      .waitForFunction(
-        () => {
-          const html = document.documentElement?.innerHTML ?? "";
-          const text = document.body?.innerText ?? "";
-
-          return (
-            /\bfact\s*=\s*\{/.test(html) ||
-            text.includes("Перевірка поточних відключень за адресою")
-          );
-        },
-        { timeout: 20000, polling: 500 }
-      )
-      .catch(() => {
-        // Нижче перевіримо, що саме повернув сайт, і сформуємо
-        // діагностичну помилку замість беззмістовного падіння.
-      });
+// Чекаємо саме на появу JSON із графіками ДТЕК.
+// Форма перевірки адреси не є ознакою готовності даних.
+await browserPage
+  .waitForFunction(
+    () => {
+      const html = document.documentElement?.innerHTML ?? ""
+      return /\bfact\s*=\s*\{/.test(html)
+    },
+    { timeout: 30000, polling: 500 }
+  )
+  .catch(() => {
+    // Нижче перевіримо, що саме повернув сайт.
+  })
 
     const pageText = await browserPage.locator("body").innerText();
     const noticeText = extractCurrentNotice(pageText);
