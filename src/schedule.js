@@ -1,6 +1,6 @@
-import { chromium } from "playwright"
-import fs from "node:fs"
-import path from "node:path"
+import { chromium } from "playwright";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   checkIsNight,
@@ -9,7 +9,7 @@ import {
   loadLastMessage,
   saveLastMessage,
   useSchedule,
-} from "./helpers.js"
+} from "./helpers.js";
 
 import {
   hours,
@@ -20,14 +20,14 @@ import {
   TELEGRAM_CHAT_ID,
   RETRIES_TIMEOUT,
   RETRIES_MAX_COUNT,
-} from "./constants.js"
+} from "./constants.js";
 
-const groupsConfig = process.env.GROUPS
+const groupsConfig = process.env.GROUPS;
 
 if (!groupsConfig?.trim()) {
   throw new Error(
     "❌ Missing GROUPS environment variable. Configure the GROUPS secret."
-  )
+  );
 }
 
 const TARGET_GROUPS = [
@@ -42,55 +42,48 @@ const TARGET_GROUPS = [
           : `GPV${group}`
       )
   ),
-]
+];
 
-console.log("Configured groups:", TARGET_GROUPS)
+console.log("Configured groups:", TARGET_GROUPS);
 
 const TOMORROW_STATE_FILE = path.resolve(
   "artifacts",
   "last-tomorrow-schedule.json"
-)
+);
 
 const SWITCHING_STATE_FILE = path.resolve(
   "artifacts",
   "switching-alert-state.json"
-)
+);
 
-const SWITCHING_WARNING_MINUTES = 30
-const SWITCHING_CORRECTION_WINDOW_MINUTES = 60
+const SWITCHING_WARNING_MINUTES = 30;
+const SWITCHING_CORRECTION_WINDOW_MINUTES = 60;
 
-let sendNotificationRetries = 0
-let getShutdownsDataRetries = 0
+let sendNotificationRetries = 0;
+let getShutdownsDataRetries = 0;
 
 function loadSwitchingState() {
   try {
-    const state = JSON.parse(
-      fs.readFileSync(SWITCHING_STATE_FILE, "utf8")
-    )
+    const state = JSON.parse(fs.readFileSync(SWITCHING_STATE_FILE, "utf8"));
 
     return {
       nextSwitches: state.nextSwitches ?? {},
-      sentWarnings: Array.isArray(state.sentWarnings)
-        ? state.sentWarnings
-        : [],
-    }
+      sentWarnings: Array.isArray(state.sentWarnings) ? state.sentWarnings : [],
+    };
   } catch {
     return {
       nextSwitches: {},
       sentWarnings: [],
-    }
+    };
   }
 }
 
 function saveSwitchingState(state) {
   fs.mkdirSync(path.dirname(SWITCHING_STATE_FILE), {
     recursive: true,
-  })
+  });
 
-  fs.writeFileSync(
-    SWITCHING_STATE_FILE,
-    JSON.stringify(state, null, 2)
-  )
+  fs.writeFileSync(SWITCHING_STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 function kyivDateParts(date = new Date()) {
@@ -102,66 +95,64 @@ function kyivDateParts(date = new Date()) {
     hour: "2-digit",
     minute: "2-digit",
     hourCycle: "h23",
-  }).formatToParts(date)
+  }).formatToParts(date);
 
-  return Object.fromEntries(
-    parts.map(({ type, value }) => [type, value])
-  )
+  return Object.fromEntries(parts.map(({ type, value }) => [type, value]));
 }
 
 function parseScheduleClock(value) {
-  const match = String(value ?? "").match(/^(\d{1,2}):(\d{2})$/)
+  const match = String(value ?? "").match(/^(\d{1,2}):(\d{2})$/);
 
-  if (!match) return null
+  if (!match) return null;
 
-  const hour = Number(match[1])
-  const minute = Number(match[2])
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
 
   if (hour < 0 || hour > 24 || minute < 0 || minute > 59) {
-    return null
+    return null;
   }
 
-  if (hour === 24 && minute !== 0) return null
+  if (hour === 24 && minute !== 0) return null;
 
-  return hour * 60 + minute
+  return hour * 60 + minute;
 }
 
 function formatScheduleDateIso(dateKey) {
-  const value = String(dateKey).trim()
+  const value = String(dateKey).trim();
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return value
+    return value;
   }
 
   if (/^\d{4}\.\d{2}\.\d{2}$/.test(value)) {
-    return value.replaceAll(".", "-")
+    return value.replaceAll(".", "-");
   }
 
   if (/^\d{2}\.\d{2}\.\d{4}$/.test(value)) {
-    const [day, month, year] = value.split(".")
-    return `${year}-${month}-${day}`
+    const [day, month, year] = value.split(".");
+    return `${year}-${month}-${day}`;
   }
 
   if (/^\d{10}$/.test(value)) {
-    const date = new Date(Number(value) * 1000)
-    const parts = kyivDateParts(date)
+    const date = new Date(Number(value) * 1000);
+    const parts = kyivDateParts(date);
 
-    return `${parts.year}-${parts.month}-${parts.day}`
+    return `${parts.year}-${parts.month}-${parts.day}`;
   }
 
-  return null
+  return null;
 }
 
 function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
-  const minutes = parseScheduleClock(clockValue)
+  const minutes = parseScheduleClock(clockValue);
 
-  if (minutes === null || !dateIso) return null
+  if (minutes === null || !dateIso) return null;
 
-  const [year, month, day] = dateIso.split("-").map(Number)
-  const dayOffset = minutes === 1440 ? 1 : 0
-  const normalizedMinutes = minutes === 1440 ? 0 : minutes
-  const hour = Math.floor(normalizedMinutes / 60)
-  const minute = normalizedMinutes % 60
+  const [year, month, day] = dateIso.split("-").map(Number);
+  const dayOffset = minutes === 1440 ? 1 : 0;
+  const normalizedMinutes = minutes === 1440 ? 0 : minutes;
+  const hour = Math.floor(normalizedMinutes / 60);
+  const minute = normalizedMinutes % 60;
 
   const targetUtcLike = Date.UTC(
     year,
@@ -169,11 +160,11 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
     day + dayOffset,
     hour,
     minute
-  )
+  );
 
   // Визначаємо фактичний UTC offset для Europe/Kyiv.
   // Це враховує перехід між літнім і зимовим часом.
-  let timestamp = targetUtcLike
+  let timestamp = targetUtcLike;
 
   for (let attempt = 0; attempt < 4; attempt++) {
     const parts = new Intl.DateTimeFormat("en-GB", {
@@ -184,11 +175,11 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
       hour: "2-digit",
       minute: "2-digit",
       hourCycle: "h23",
-    }).formatToParts(new Date(timestamp))
+    }).formatToParts(new Date(timestamp));
 
     const values = Object.fromEntries(
       parts.map(({ type, value }) => [type, value])
-    )
+    );
 
     const representedUtcLike = Date.UTC(
       Number(values.year),
@@ -196,114 +187,110 @@ function kyivLocalDateTimeToTimestamp(dateIso, clockValue) {
       Number(values.day),
       Number(values.hour),
       Number(values.minute)
-    )
+    );
 
-    const difference = targetUtcLike - representedUtcLike
-    timestamp += difference
+    const difference = targetUtcLike - representedUtcLike;
+    timestamp += difference;
 
-    if (difference === 0) break
+    if (difference === 0) break;
   }
 
-  return timestamp
+  return timestamp;
 }
 
 function getSwitchingEvents(schedules, dateKey, now = new Date()) {
-  const scheduleDate = formatScheduleDateIso(dateKey)
+  const scheduleDate = formatScheduleDateIso(dateKey);
 
   if (!scheduleDate) {
     console.warn(
       `⚠️ Cannot parse schedule date for switching alerts: ${dateKey}`
-    )
-    return []
+    );
+    return [];
   }
 
-  return schedules.flatMap(({ group, schedule }) => {
-    const sorted = [...schedule].sort(
-      (a, b) =>
-        (parseScheduleClock(a.begin) ?? -1) -
-        (parseScheduleClock(b.begin) ?? -1)
-    )
+  return schedules
+    .flatMap(({ group, schedule }) => {
+      const sorted = [...schedule].sort(
+        (a, b) =>
+          (parseScheduleClock(a.begin) ?? -1) -
+          (parseScheduleClock(b.begin) ?? -1)
+      );
 
-    const groupEvents = []
+      const groupEvents = [];
 
-    for (let index = 1; index < sorted.length; index++) {
-      const previous = sorted[index - 1]
-      const current = sorted[index]
+      for (let index = 1; index < sorted.length; index++) {
+        const previous = sorted[index - 1];
+        const current = sorted[index];
 
-      if (
-        typeof previous.power !== "boolean" ||
-        typeof current.power !== "boolean" ||
-        previous.power === current.power
-      ) {
-        continue
+        if (
+          typeof previous.power !== "boolean" ||
+          typeof current.power !== "boolean" ||
+          previous.power === current.power
+        ) {
+          continue;
+        }
+
+        const previousEnd = parseScheduleClock(previous.end);
+        const currentBegin = parseScheduleClock(current.begin);
+
+        // Періоди мають бути суміжними, щоб визначати перемикання.
+        if (
+          previousEnd === null ||
+          currentBegin === null ||
+          previousEnd !== currentBegin
+        ) {
+          continue;
+        }
+
+        const timestamp = kyivLocalDateTimeToTimestamp(
+          scheduleDate,
+          current.begin
+        );
+
+        if (timestamp === null || !Number.isFinite(timestamp)) {
+          continue;
+        }
+
+        const time =
+          currentBegin === 1440
+            ? "00:00"
+            : `${String(Math.floor(currentBegin / 60)).padStart( 2, "0" )}:${String(currentBegin % 60).padStart(2, "0")}`;
+
+        groupEvents.push({
+          id: `${scheduleDate}|${group}|${time}|${ current.power ? "ON" : "OFF" }`,
+          group,
+          time,
+          power: current.power,
+          timestamp,
+          date: scheduleDate,
+        });
       }
 
-      const previousEnd = parseScheduleClock(previous.end)
-      const currentBegin = parseScheduleClock(current.begin)
-
-      // Періоди мають бути суміжними, щоб визначати перемикання.
-      if (
-        previousEnd === null ||
-        currentBegin === null ||
-        previousEnd !== currentBegin
-      ) {
-        continue
-      }
-
-      const timestamp = kyivLocalDateTimeToTimestamp(
-        scheduleDate,
-        current.begin
-      )
-
-      if (timestamp === null || !Number.isFinite(timestamp)) {
-        continue
-      }
-
-      const time =
-        currentBegin === 1440
-          ? "00:00"
-          : `${String(Math.floor(currentBegin / 60)).padStart(2, "0")}:${String(currentBegin % 60).padStart(2, "0")}`
-
-      groupEvents.push({
-        id: `${scheduleDate}|${group}|${time}|${current.power ? "ON" : "OFF"}`,
-        group,
-        time,
-        power: current.power,
-        timestamp,
-        date: scheduleDate,
-      })
-    }
-
-    return groupEvents
-  }).filter((event) => event.timestamp > now.getTime() - 60_000)
+      return groupEvents;
+    })
+    .filter((event) => event.timestamp > now.getTime() - 60_000);
 }
 
 function compareGroupNumbers(groupA, groupB) {
-  const partsA = groupA
-    .replace(/^GPV/i, "")
-    .split(".")
-    .map(Number)
+  const partsA = groupA.replace(/^GPV/i, "").split(".").map(Number);
 
-  const partsB = groupB
-    .replace(/^GPV/i, "")
-    .split(".")
-    .map(Number)
+  const partsB = groupB.replace(/^GPV/i, "").split(".").map(Number);
 
-  const length = Math.max(partsA.length, partsB.length)
+  const length = Math.max(partsA.length, partsB.length);
 
   for (let index = 0; index < length; index++) {
-    const a = partsA[index] ?? 0
-    const b = partsB[index] ?? 0
+    const a = partsA[index] ?? 0;
+    const b = partsB[index] ?? 0;
 
-    if (a !== b) return a - b
+    if (a !== b) return a - b;
   }
 
-  return 0
+  return 0;
 }
 
 async function sendSwitchingMessage(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    throw Error("Missing Telegram bot token or chat id.")
+    throw Error("Missing Telegram bot token or chat id.");
   }
 
   const response = await fetch(
@@ -320,66 +307,52 @@ async function sendSwitchingMessage(text) {
         disable_notification: checkIsNight(),
       }),
     }
-  )
+  );
 
-  const result = await response.json()
+  const result = await response.json();
 
   if (!result.ok) {
-    throw Error(
-      result.description || "Telegram sendMessage failed"
-    )
+    throw Error(result.description || "Telegram sendMessage failed");
   }
 
-  return result.result
+  return result.result;
 }
 
-async function processSwitchingAlerts(
-  schedules,
-  dateKey,
-  now = new Date()
-) {
-  const state = loadSwitchingState()
-  const events = getSwitchingEvents(schedules, dateKey, now)
-  const nowMs = now.getTime()
+async function processSwitchingAlerts(schedules, dateKey, now = new Date()) {
+  const state = loadSwitchingState();
+  const events = getSwitchingEvents(schedules, dateKey, now);
+  const nowMs = now.getTime();
 
-  const warningWindowMs =
-    SWITCHING_WARNING_MINUTES * 60_000
+  const warningWindowMs = SWITCHING_WARNING_MINUTES * 60_000;
 
-  const correctionWindowMs =
-    SWITCHING_CORRECTION_WINDOW_MINUTES * 60_000
+  const correctionWindowMs = SWITCHING_CORRECTION_WINDOW_MINUTES * 60_000;
 
-  const nextByGroup = {}
+  const nextByGroup = {};
 
   for (const group of TARGET_GROUPS) {
     const next = events
-      .filter(
-        (event) =>
-          event.group === group &&
-          event.timestamp > nowMs
-      )
-      .sort((a, b) => a.timestamp - b.timestamp)[0]
+      .filter((event) => event.group === group && event.timestamp > nowMs)
+      .sort((a, b) => a.timestamp - b.timestamp)[0];
 
-    if (next) nextByGroup[group] = next
+    if (next) nextByGroup[group] = next;
   }
 
-  let correctionNeeded = false
+  let correctionNeeded = false;
 
-  for (const [group, previous] of Object.entries(
-    state.nextSwitches || {}
-  )) {
+  for (const [group, previous] of Object.entries(state.nextSwitches || {})) {
     if (
       !previous ||
       previous.timestamp <= nowMs ||
       previous.timestamp - nowMs > correctionWindowMs
     ) {
-      continue
+      continue;
     }
 
-    const current = nextByGroup[group]
+    const current = nextByGroup[group];
 
     if (!current || current.id !== previous.id) {
-      correctionNeeded = true
-      break
+      correctionNeeded = true;
+      break;
     }
   }
 
@@ -387,49 +360,45 @@ async function processSwitchingAlerts(
   // Повертаємо прапорець, щоб попередження додалося першим рядком
   // до основного повідомлення з оновленим графіком.
 
-  const sentWarnings = new Set(state.sentWarnings || [])
+  const sentWarnings = new Set(state.sentWarnings || []);
 
   const dueEvents = events.filter((event) => {
-    const minutesUntil = event.timestamp - nowMs
+    const minutesUntil = event.timestamp - nowMs;
 
     return (
       minutesUntil > 0 &&
       minutesUntil <= warningWindowMs &&
       !sentWarnings.has(event.id)
-    )
-  })
+    );
+  });
 
   // Групуємо події за точним часом перемикання.
-  const eventsByTime = new Map()
+  const eventsByTime = new Map();
 
   for (const event of dueEvents) {
     if (!eventsByTime.has(event.timestamp)) {
-      eventsByTime.set(event.timestamp, [])
+      eventsByTime.set(event.timestamp, []);
     }
 
-    eventsByTime.get(event.timestamp).push(event)
+    eventsByTime.get(event.timestamp).push(event);
   }
 
-  const timestamps = [...eventsByTime.keys()].sort(
-    (a, b) => a - b
-  )
+  const timestamps = [...eventsByTime.keys()].sort((a, b) => a - b);
 
   for (const timestamp of timestamps) {
-    const groupedEvents = eventsByTime.get(timestamp)
+    const groupedEvents = eventsByTime.get(timestamp);
 
-    groupedEvents.sort((a, b) =>
-      compareGroupNumbers(a.group, b.group)
-    )
+    groupedEvents.sort((a, b) => compareGroupNumbers(a.group, b.group));
 
-    const time = groupedEvents[0].time
+    const time = groupedEvents[0].time;
 
     const lines = groupedEvents.map((event) => {
-      const displayGroup = event.group.replace(/^GPV/i, "")
-      const icon = event.power ? "🔋" : "🪫"
-      const action = event.power ? "увімкнення" : "відключення"
+      const displayGroup = event.group.replace(/^GPV/i, "");
+      const icon = event.power ? "🔋" : "🪫";
+      const action = event.power ? "увімкнення" : "відключення";
 
-      return `${icon} Черга ${displayGroup} — ${action} світла о <b>${time}</b>`
-    })
+      return `${icon} Черга ${displayGroup} — ${action} світла о <b>${time}</b>`;
+    });
 
     await sendSwitchingMessage(
       [
@@ -439,68 +408,59 @@ async function processSwitchingAlerts(
         "",
         "<i>(сьогодні)</i>",
       ].join("\n")
-    )
+    );
 
     for (const event of groupedEvents) {
-      sentWarnings.add(event.id)
+      sentWarnings.add(event.id);
     }
   }
 
-  state.sentWarnings = [...sentWarnings].slice(-500)
-  state.nextSwitches = nextByGroup
+  state.sentWarnings = [...sentWarnings].slice(-500);
+  state.nextSwitches = nextByGroup;
 
-  saveSwitchingState(state)
-  return correctionNeeded
+  saveSwitchingState(state);
+  return correctionNeeded;
 }
 
 function loadTomorrowMessage() {
   if (!fs.existsSync(TOMORROW_STATE_FILE)) {
-    return null
+    return null;
   }
 
   try {
-    return JSON.parse(
-      fs.readFileSync(TOMORROW_STATE_FILE, "utf8")
-    )
+    return JSON.parse(fs.readFileSync(TOMORROW_STATE_FILE, "utf8"));
   } catch (error) {
-    console.error(
-      `❌ Failed to read tomorrow state: ${error.message}`
-    )
+    console.error(`❌ Failed to read tomorrow state: ${error.message}`);
 
-    return null
+    return null;
   }
 }
 
 function saveTomorrowMessage(message) {
   fs.mkdirSync(path.dirname(TOMORROW_STATE_FILE), {
     recursive: true,
-  })
+  });
 
-  fs.writeFileSync(
-    TOMORROW_STATE_FILE,
-    JSON.stringify(message, null, 2)
-  )
+  fs.writeFileSync(TOMORROW_STATE_FILE, JSON.stringify(message, null, 2));
 }
 
 // Читаємо тільки блок поточного повідомлення над формою пошуку адреси.
 // Не скануємо всю сторінку, щоб не сплутати актуальний статус із FAQ.
 function extractCurrentNotice(pageText) {
-  const text = String(pageText ?? "").replace(/\u00a0/g, " ")
-  const startMatch = /Шановні клієнти!\s*/iu.exec(text)
+  const text = String(pageText ?? "").replace(/\u00a0/g, " ");
+  const startMatch = /Шановні клієнти!\s*/iu.exec(text);
 
   if (!startMatch) {
-    return null
+    return null;
   }
 
-  const start = startMatch.index + startMatch[0].length
-  const endMarker = "Перевірка поточних відключень за адресою"
-  const end = text.indexOf(endMarker, start)
+  const start = startMatch.index + startMatch[0].length;
+  const endMarker = "Перевірка поточних відключень за адресою";
+  const end = text.indexOf(endMarker, start);
 
-  const notice = text
-    .slice(start, end >= 0 ? end : start + 1600)
-    .trim()
+  const notice = text.slice(start, end >= 0 ? end : start + 1600).trim();
 
-  return notice || null
+  return notice || null;
 }
 
 function detectOutageMode(noticeText) {
@@ -508,23 +468,25 @@ function detectOutageMode(noticeText) {
     return {
       mode: "unknown",
       reason: "current DTEK notice section was not found",
-    }
+    };
   }
 
   const text = noticeText
     .toLocaleLowerCase("uk-UA")
     .replace(/\s+/g, " ")
-    .trim()
+    .trim();
 
   const schedulesInactive =
-    /графік[а-яіїєґ\s-]{0,80}\bне\s+(?:діють|діє|застосовуються|застосовується)\b/u.test(text) ||
-    /\bне\s+(?:діють|застосовуються)\b[^.]{0,80}\bграфік/u.test(text)
+    /графік[а-яіїєґ\s-]{0,80}\bне\s+(?:діють|діє|застосовуються|застосовується)\b/u.test(
+      text
+    ) || /\bне\s+(?:діють|застосовуються)\b[^.]{0,80}\bграфік/u.test(text);
 
-  const mentionsEmergency =
-    /екстрен[а-яіїєґ]*\s+відключ/iu.test(text)
+  const mentionsEmergency = /екстрен[а-яіїєґ]*\s+відключ/iu.test(text);
 
   const emergencyExplicitlyIntroduced =
-    /(?:введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*|застосован[а-яіїєґ]*|оголошен[а-яіїєґ]*|діють)[^.!?]{0,100}екстрен[а-яіїєґ]*\s+відключ/iu.test(text)
+    /(?:введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*|застосован[а-яіїєґ]*|оголошен[а-яіїєґ]*|діють)[^.!?]{0,100}екстрен[а-яіїєґ]*\s+відключ/iu.test(
+      text
+    );
 
   // Згадка "уникнути екстрених відключень" не означає,
   // що екстрені відключення вже введено.
@@ -535,29 +497,27 @@ function detectOutageMode(noticeText) {
     return {
       mode: "emergency",
       reason: "active emergency-outage wording found in the current notice",
-    }
+    };
   }
 
-  const mentionsAccident =
-    /аварійн[а-яіїєґ]*\s+відключ/iu.test(text)
+  const mentionsAccident = /аварійн[а-яіїєґ]*\s+відключ/iu.test(text);
 
   const accidentExplicitlyReported =
-    /(?:зафіксован[а-яіїєґ]*|сталися|сталося|сталася|відбуваються|введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*)[^.!?]{0,120}аварійн[а-яіїєґ]*\s+відключ/iu.test(text)
+    /(?:зафіксован[а-яіїєґ]*|сталися|сталося|сталася|відбуваються|введен[а-яіїєґ]*|запроваджен[а-яіїєґ]*)[^.!?]{0,120}аварійн[а-яіїєґ]*\s+відключ/iu.test(
+      text
+    );
 
-  if (
-    mentionsAccident &&
-    (schedulesInactive || accidentExplicitlyReported)
-  ) {
+  if (mentionsAccident && (schedulesInactive || accidentExplicitlyReported)) {
     return {
       mode: "accident",
       reason: "active accident-outage wording found in the current notice",
-    }
+    };
   }
 
   return {
     mode: "normal",
     reason: "no active emergency/accident outage notice detected",
-  }
+  };
 }
 
 function getOutageModeBanner(mode) {
@@ -566,61 +526,106 @@ function getOutageModeBanner(mode) {
       "🚨 <b>Екстрені відключення. Планові графіки можуть не діяти.</b>",
     accident:
       "⚠️ <b>Аварійні відключення. Планові графіки можуть не діяти.</b>",
-  }
+  };
 
-  return messages[mode] ?? ""
+  return messages[mode] ?? "";
 }
 
 function addOutageBanner(text, mode) {
-  const banner = getOutageModeBanner(mode)
-  return banner ? `${banner}\n\n${text}` : text
+  const banner = getOutageModeBanner(mode);
+  return banner ? `${banner}\n\n${text}` : text;
 }
 
 async function getShutdownsData() {
-  console.log("🌀 Getting shutdowns data...")
+  console.log("🌀 Getting shutdowns data...");
 
-  let browser
+  let browser;
 
   try {
-    browser = await chromium.launch({ headless: true })
+    browser = await chromium.launch({ headless: true });
 
     const browserPage = await browser.newPage({
       locale: "uk-UA",
       timezoneId: "Europe/Kyiv",
-    })
+    });
 
     await browserPage.goto(SHUTDOWNS_PAGE, {
-      waitUntil: "load",
-    })
+      // Не чекаємо повного load: сторонні скрипти ДТЕК можуть затримувати
+      // цю подію. Після DOMContentLoaded окремо чекаємо на дані графіків.
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+    });
 
-    const pageText = await browserPage.locator("body").innerText()
-    const noticeText = extractCurrentNotice(pageText)
-    const outageStatus = detectOutageMode(noticeText)
+    // ДТЕК іноді спочатку повертає сторінку очікування Incapsula.
+    // Вона може автоматично перейти до справжньої сторінки пізніше.
+    // Чекаємо на JSON графіків або на основний блок сторінки.
+    await browserPage
+      .waitForFunction(
+        () => {
+          const html = document.documentElement?.innerHTML ?? "";
+          const text = document.body?.innerText ?? "";
 
-    console.log(
-      `[OUTAGE STATUS] ${outageStatus.mode}: ${outageStatus.reason}`
-    )
+          return (
+            /\bfact\s*=\s*\{/.test(html) ||
+            text.includes("Перевірка поточних відключень за адресою")
+          );
+        },
+        { timeout: 20000, polling: 500 }
+      )
+      .catch(() => {
+        // Нижче перевіримо, що саме повернув сайт, і сформуємо
+        // діагностичну помилку замість беззмістовного падіння.
+      });
+
+    const pageText = await browserPage.locator("body").innerText();
+    const noticeText = extractCurrentNotice(pageText);
+    const outageStatus = detectOutageMode(noticeText);
+
+    console.log(`[OUTAGE STATUS] ${outageStatus.mode}: ${outageStatus.reason}`);
 
     console.log(
       "[OUTAGE NOTICE]",
-      noticeText
-        ? JSON.stringify(noticeText)
-        : "(current notice not found)"
-    )
+      noticeText ? JSON.stringify(noticeText) : "(current notice not found)"
+    );
 
-    const html = await browserPage.content()
-    const match = html.match(SHUTDOWNS_DATA_MATCHER)
+    const html = await browserPage.content();
+    const match = html.match(SHUTDOWNS_DATA_MATCHER);
+
+    const isIncapsulaWaitingRoom =
+      /кімната очікування|велике навантаження на сайт|дочекайтесь[^.!?]*автоматичного завантаження/i.test(
+        pageText
+      );
+
+    if (!match) {
+      console.error(
+        "[DTEK PAGE DIAGNOSTIC]",
+        JSON.stringify({
+          url: browserPage.url(),
+          title: await browserPage.title().catch(() => ""),
+          isIncapsulaWaitingRoom,
+          htmlLength: html.length,
+          hasFactWord: /\bfact\b/i.test(html),
+          bodyPreview: pageText.slice(0, 700),
+        })
+      );
+    }
 
     // Якщо є підтверджене попередження, його можна показати,
     // навіть коли JSON погодинного графіка тимчасово недоступний.
     if (!match) {
+      if (isIncapsulaWaitingRoom) {
+        throw new Error(
+          "DTEK returned the Incapsula waiting room instead of the shutdowns page"
+        );
+      }
+
       if (
         outageStatus.mode === "emergency" ||
         outageStatus.mode === "accident"
       ) {
         console.warn(
           "⚠️ Schedule JSON is unavailable, but an active outage notice was detected."
-        )
+        );
 
         return {
           today: null,
@@ -628,81 +633,77 @@ async function getShutdownsData() {
           update: null,
           outageMode: outageStatus.mode,
           outageNotice: noticeText,
-        }
+        };
       }
 
-      throw new Error("Shutdowns data not found in page HTML")
+      throw new Error("Shutdowns data not found in page HTML");
     }
 
-    const result = JSON.parse(match[1])
+    const result = JSON.parse(match[1]);
 
     // Діагностика сирих даних черг.
-    const todayGroupData = result.data?.[result.today] ?? {}
+    const todayGroupData = result.data?.[result.today] ?? {};
 
     for (const group of TARGET_GROUPS) {
       console.log(
         `[DIAGNOSTIC] Raw data for ${group}:`,
         JSON.stringify(todayGroupData[group] ?? null).slice(0, 1500)
-      )
+      );
     }
 
-    console.log("✅ Getting shutdowns data finished.")
+    console.log("✅ Getting shutdowns data finished.");
 
     return {
       ...result,
       outageMode: outageStatus.mode,
       outageNotice: noticeText,
-    }
+    };
   } catch (error) {
-    console.error(
-      `❌ Getting shutdowns data failed: ${error.message}.`
-    )
+    console.error(`❌ Getting shutdowns data failed: ${error.message}.`);
   } finally {
     if (browser) {
-      await browser.close()
+      await browser.close();
     }
   }
 
   if (getShutdownsDataRetries < RETRIES_MAX_COUNT) {
-    getShutdownsDataRetries++
+    getShutdownsDataRetries++;
 
-    console.log("🌀 Try getting shutdowns data again...")
+    console.log("🌀 Try getting shutdowns data again...");
 
-    await new Promise((resolve) =>
-      setTimeout(resolve, RETRIES_TIMEOUT)
-    )
+    await new Promise((resolve) => setTimeout(resolve, RETRIES_TIMEOUT));
 
-    return await getShutdownsData()
+    return await getShutdownsData();
   }
 
   throw Error(
     `❌ Getting shutdowns data failed after ${RETRIES_MAX_COUNT} retries.`
-  )
+  );
 }
 
 function generateSchedule({ data, today, group }) {
-  console.log(`🌀 Generating schedule for group ${group}...`)
+  console.log(`🌀 Generating schedule for group ${group}...`);
 
   try {
-    const hoursStates = data[today]?.[group]
+    const hoursStates = data[today]?.[group];
 
     if (!hoursStates) {
-      throw Error(`Group ${group} not found`)
+      throw Error(`Group ${group} not found`);
     }
 
-    const [schedule, setSchedule] = useSchedule([])
+    const [schedule, setSchedule] = useSchedule([]);
 
     hours.forEach((hour) => {
-      const state = hoursStates[hour + 1]
+      const state = hoursStates[hour + 1];
 
       switch (state) {
         case PowerState.ON:
-          setSchedule(createPeriod({ hour, power: true }))
-          break
+          setSchedule(createPeriod({ hour, power: true }));
+          break;
 
         case PowerState.OFF:
-          setSchedule(createPeriod({ hour, power: false }))
-          break
+          setSchedule(createPeriod({ hour, power: false }));
+          break;
 
         case PowerState.HALF_ON:
           setSchedule(
@@ -711,7 +712,7 @@ function generateSchedule({ data, today, group }) {
               endMin: 30,
               power: true,
             })
-          )
+          );
 
           setSchedule(
             createPeriod({
@@ -719,8 +720,8 @@ function generateSchedule({ data, today, group }) {
               startMin: 30,
               power: false,
             })
-          )
-          break
+          );
+          break;
 
         case PowerState.HALF_OFF:
           setSchedule(
@@ -729,7 +730,7 @@ function generateSchedule({ data, today, group }) {
               endMin: 30,
               power: false,
             })
-          )
+          );
 
           setSchedule(
             createPeriod({
@@ -737,124 +738,103 @@ function generateSchedule({ data, today, group }) {
               startMin: 30,
               power: true,
             })
-          )
-          break
+          );
+          break;
       }
-    })
+    });
 
-    console.log(
-      `✅ Generating schedule for group ${group} finished.`
-    )
+    console.log(`✅ Generating schedule for group ${group} finished.`);
 
-    return schedule
+    return schedule;
   } catch (error) {
     throw Error(
       `❌ Generating schedule for group ${group} failed: ${error.message}.`
-    )
+    );
   }
 }
 
-function generateMessage(
-  schedules,
-  update,
-  dateLabel = "сьогодні"
-) {
-  console.log("🌀 Generating message...")
+function generateMessage(schedules, update, dateLabel = "сьогодні") {
+  console.log("🌀 Generating message...");
 
   const sections = schedules.map(({ group, schedule }) => {
-    const displayGroup = group.replace(/^GPV/i, "")
-    const hasShutdowns = schedule.some(({ power }) => !power)
+    const displayGroup = group.replace(/^GPV/i, "");
+    const hasShutdowns = schedule.some(({ power }) => !power);
 
     const scheduleLines = hasShutdowns
       ? schedule
           .filter(({ power }) => !power)
           .map(({ begin, end }) => `🪫 ${begin} — ${end}`)
-      : schedule.map(
-          ({ begin, end }) => `🔋 ${begin} — ${end}`
-        )
+      : schedule.map(({ begin, end }) => `🔋 ${begin} — ${end}`);
 
     return {
       group: displayGroup,
       scheduleText: scheduleLines.join("\n"),
-      text: [
-        `📍 <b>Черга ${displayGroup}</b>`,
-        ...scheduleLines,
-      ].join("\n"),
-    }
-  })
+      text: [`📍 <b>Черга ${displayGroup}</b>`, ...scheduleLines].join("\n"),
+    };
+  });
 
   const scheduleText = sections
-    .map(
-      ({ group, scheduleText }) =>
-        `Черга ${group}\n${scheduleText}`
-    )
-    .join("\n\n")
+    .map(({ group, scheduleText }) => `Черга ${group}\n${scheduleText}`)
+    .join("\n\n");
 
-  const isTomorrow = dateLabel.startsWith("завтра")
+  const isTomorrow = dateLabel.startsWith("завтра");
 
   const text = [
     isTomorrow
-      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel.slice(8).trim()})</b> 📅`
+      ? `📅 <b>⚠️ ГРАФІК ВІДКЛЮЧЕНЬ НА ЗАВТРА (${dateLabel .slice(8) .trim()})</b> 📅`
       : `⚡️ <b>Графік відключень на ${dateLabel}:</b>`,
     "",
     ...sections.map(({ text }) => text),
     "",
     `🕒 <i>Останнє оновлення ДТЕК: ${update ?? "невідомо"}</i>`,
     `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
-  ].join("\n")
+  ].join("\n");
 
-  return { text, scheduleText }
+  return { text, scheduleText };
 }
 
 async function sendNotification({ text, scheduleText }) {
   if (!TELEGRAM_BOT_TOKEN) {
-    throw Error("❌ Missing telegram bot token.")
+    throw Error("❌ Missing telegram bot token.");
   }
 
   if (!TELEGRAM_CHAT_ID) {
-    throw Error("❌ Missing telegram chat id.")
+    throw Error("❌ Missing telegram chat id.");
   }
 
-  console.log("🌀 Sending today's notification...")
+  console.log("🌀 Sending today's notification...");
 
-  const lastMessage = loadLastMessage() || {}
+  const lastMessage = loadLastMessage() || {};
 
-  const previousScheduleText = String(
-    lastMessage.scheduleText ?? ""
-  )
+  const previousScheduleText = String(lastMessage.scheduleText ?? "");
 
   const wasConfirmedOutageMode =
     previousScheduleText.startsWith("MODE:emergency|") ||
     previousScheduleText.startsWith("MODE:accident|") ||
     previousScheduleText === "OUTAGE_MODE:emergency" ||
-    previousScheduleText === "OUTAGE_MODE:accident"
+    previousScheduleText === "OUTAGE_MODE:accident";
 
   const isNowOutageMode =
     String(scheduleText).startsWith("MODE:emergency|") ||
-    String(scheduleText).startsWith("MODE:accident|")
+    String(scheduleText).startsWith("MODE:accident|");
 
   if (wasConfirmedOutageMode && !isNowOutageMode) {
     text = [
       "✅ <b>Сайт ДТЕК більше не показує активне повідомлення про аварійні або екстрені відключення.</b>",
       "",
       text,
-    ].join("\n")
+    ].join("\n");
   }
 
-  const isScheduleChanged =
-    lastMessage.scheduleText !== scheduleText
+  const isScheduleChanged = lastMessage.scheduleText !== scheduleText;
 
-  const isEdit =
-    Boolean(lastMessage.message_id) && !isScheduleChanged
+  const isEdit = Boolean(lastMessage.message_id) && !isScheduleChanged;
 
-  const isReply =
-    Boolean(lastMessage.message_id) && isScheduleChanged
+  const isReply = Boolean(lastMessage.message_id) && isScheduleChanged;
 
   try {
     const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${
-        isEdit ? "editMessageText" : "sendMessage"
-      }`,
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${ isEdit ? "editMessageText" : "sendMessage" }`,
       {
         method: "POST",
         headers: {
@@ -865,9 +845,7 @@ async function sendNotification({ text, scheduleText }) {
           text,
           parse_mode: "HTML",
           disable_notification: checkIsNight(),
-          message_id: isEdit
-            ? lastMessage.message_id
-            : undefined,
+          message_id: isEdit ? lastMessage.message_id : undefined,
           reply_parameters: isReply
             ? {
                 message_id: lastMessage.message_id,
@@ -876,84 +854,70 @@ async function sendNotification({ text, scheduleText }) {
             : undefined,
         }),
       }
-    )
+    );
 
-    const result = await response.json()
+    const result = await response.json();
 
     if (result.description?.includes("not modified")) {
-      console.log("🟡 Today's notification not changed.")
-      return
+      console.log("🟡 Today's notification not changed.");
+      return;
     }
 
     if (!result.ok) {
-      throw Error(result.description)
+      throw Error(result.description);
     }
 
     saveLastMessage({
       ...result.result,
       scheduleText,
-    })
+    });
 
-    console.log("🟢 Today's notification updated.")
+    console.log("🟢 Today's notification updated.");
   } catch (error) {
-    console.error(
-      `❌ Sending today's notification failed: ${error.message}.`
-    )
+    console.error(`❌ Sending today's notification failed: ${error.message}.`);
 
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
-      sendNotificationRetries++
+      sendNotificationRetries++;
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, RETRIES_TIMEOUT)
-      )
+      await new Promise((resolve) => setTimeout(resolve, RETRIES_TIMEOUT));
 
-      console.log("🌀 Try sending today's notification again...")
+      console.log("🌀 Try sending today's notification again...");
 
-      return await sendNotification({ text, scheduleText })
+      return await sendNotification({ text, scheduleText });
     }
 
     throw Error(
       `❌ Sending today's notification failed after ${RETRIES_MAX_COUNT} retries.`
-    )
+    );
   }
 }
 
-async function sendTomorrowNotification({
-  text,
-  scheduleText,
-  scheduleDate,
-}) {
+async function sendTomorrowNotification({ text, scheduleText, scheduleDate }) {
   if (!TELEGRAM_BOT_TOKEN) {
-    throw Error("❌ Missing telegram bot token.")
+    throw Error("❌ Missing telegram bot token.");
   }
 
   if (!TELEGRAM_CHAT_ID) {
-    throw Error("❌ Missing telegram chat id.")
+    throw Error("❌ Missing telegram chat id.");
   }
 
-  console.log("🌀 Updating tomorrow's notification...")
+  console.log("🌀 Updating tomorrow's notification...");
 
-  const lastMessage = loadTomorrowMessage() || {}
+  const lastMessage = loadTomorrowMessage() || {};
 
-  const isSameDate = lastMessage.scheduleDate === scheduleDate
+  const isSameDate = lastMessage.scheduleDate === scheduleDate;
 
   const isScheduleChanged =
-    !isSameDate ||
-    lastMessage.scheduleText !== scheduleText
+    !isSameDate || lastMessage.scheduleText !== scheduleText;
 
-  const isEdit =
-    Boolean(lastMessage.message_id) && isSameDate
+  const isEdit = Boolean(lastMessage.message_id) && isSameDate;
 
   const isReply =
-    Boolean(lastMessage.message_id) &&
-    isScheduleChanged &&
-    isSameDate
+    Boolean(lastMessage.message_id) && isScheduleChanged && isSameDate;
 
   try {
     const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${
-        isEdit ? "editMessageText" : "sendMessage"
-      }`,
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${ isEdit ? "editMessageText" : "sendMessage" }`,
       {
         method: "POST",
         headers: {
@@ -964,9 +928,7 @@ async function sendTomorrowNotification({
           text,
           parse_mode: "HTML",
           disable_notification: checkIsNight(),
-          message_id: isEdit
-            ? lastMessage.message_id
-            : undefined,
+          message_id: isEdit ? lastMessage.message_id : undefined,
           reply_parameters: isReply
             ? {
                 message_id: lastMessage.message_id,
@@ -975,68 +937,64 @@ async function sendTomorrowNotification({
             : undefined,
         }),
       }
-    )
+    );
 
-    const result = await response.json()
+    const result = await response.json();
 
     if (result.description?.includes("not modified")) {
       console.log(
         "🟡 Tomorrow's notification text is identical; no edit needed."
-      )
-      return
+      );
+      return;
     }
 
     if (!result.ok) {
-      throw Error(result.description)
+      throw Error(result.description);
     }
 
     saveTomorrowMessage({
       message_id: result.result.message_id,
       scheduleDate,
       scheduleText,
-    })
+    });
 
-    console.log("🟢 Tomorrow's notification updated.")
+    console.log("🟢 Tomorrow's notification updated.");
   } catch (error) {
     console.error(
       `❌ Updating tomorrow's notification failed: ${error.message}.`
-    )
+    );
 
     if (sendNotificationRetries < RETRIES_MAX_COUNT) {
-      sendNotificationRetries++
+      sendNotificationRetries++;
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, RETRIES_TIMEOUT)
-      )
+      await new Promise((resolve) => setTimeout(resolve, RETRIES_TIMEOUT));
 
-      console.log("🌀 Try updating tomorrow's notification again...")
+      console.log("🌀 Try updating tomorrow's notification again...");
 
       return await sendTomorrowNotification({
         text,
         scheduleText,
         scheduleDate,
-      })
+      });
     }
 
     throw Error(
       `❌ Updating tomorrow's notification failed after ${RETRIES_MAX_COUNT} retries.`
-    )
+    );
   }
 }
 
 function getAvailableSchedules(data, date) {
-  const dateData = data[date]
+  const dateData = data[date];
 
   if (!dateData || !Object.keys(dateData).length) {
-    return null
+    return null;
   }
 
-  const availableGroups = TARGET_GROUPS.filter(
-    (group) => dateData[group]
-  )
+  const availableGroups = TARGET_GROUPS.filter((group) => dateData[group]);
 
   if (!availableGroups.length) {
-    return null
+    return null;
   }
 
   return availableGroups.map((group) => ({
@@ -1046,81 +1004,79 @@ function getAvailableSchedules(data, date) {
       today: date,
       group,
     }),
-  }))
+  }));
 }
 
 function formatScheduleDate(dateKey) {
-  const value = String(dateKey).trim()
+  const value = String(dateKey).trim();
 
   if (/^\d{10}$/.test(value)) {
-    const date = new Date(Number(value) * 1000)
+    const date = new Date(Number(value) * 1000);
 
     return date.toLocaleDateString("uk-UA", {
       timeZone: "Europe/Kyiv",
       day: "2-digit",
       month: "2-digit",
       year: "numeric",
-    })
+    });
   }
 
-  let year
-  let month
-  let day
+  let year;
+  let month;
+  let day;
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    ;[year, month, day] = value.split("-")
+    [year, month, day] = value.split("-");
   } else if (/^\d{2}\.\d{2}\.\d{4}$/.test(value)) {
-    ;[day, month, year] = value.split(".")
+    [day, month, year] = value.split(".");
   } else if (/^\d{4}\.\d{2}\.\d{2}$/.test(value)) {
-    ;[year, month, day] = value.split(".")
+    [year, month, day] = value.split(".");
   } else {
-    console.warn(
-      `⚠️ Unrecognized schedule date format: ${value}`
-    )
-    return value
+    console.warn(`⚠️ Unrecognized schedule date format: ${value}`);
+    return value;
   }
 
-  return `${day}.${month}.${year}`
+  return `${day}.${month}.${year}`;
 }
 
 async function run() {
-  console.log("Configured groups:", TARGET_GROUPS)
+  console.log("Configured groups:", TARGET_GROUPS);
 
-  const result = await getShutdownsData()
+  const result = await getShutdownsData();
 
   // Якщо статус не вдалося визначити, працюємо у звичайному режимі.
   // Попередження показуємо лише для підтверджених аварійних/екстрених станів.
-  const detectedMode = result.outageMode ?? "unknown"
+  const detectedMode = result.outageMode ?? "unknown";
   const outageMode =
     detectedMode === "emergency" || detectedMode === "accident"
       ? detectedMode
-      : "normal"
+      : "normal";
 
-  console.log("Today:", result.today)
-  console.log("Detected outage mode:", detectedMode)
-  console.log("Mode used by bot:", outageMode)
+  console.log("Today:", result.today);
+  console.log("Detected outage mode:", detectedMode);
+  console.log("Mode used by bot:", outageMode);
 
-  const data = result.data ?? {}
-  const dates = Object.keys(data).sort()
-  const today = result.today
+  const data = result.data ?? {};
+  const dates = Object.keys(data).sort();
+  const today = result.today;
 
-  console.log("Available dates:", dates)
+  console.log("Available dates:", dates);
 
-  const todaySchedules = getAvailableSchedules(data, today)
+  const todaySchedules = getAvailableSchedules(data, today);
 
   if (todaySchedules) {
     const todayMessage = generateMessage(
       todaySchedules,
       result.update,
       "сьогодні"
-    )
+    );
 
     // Перевіряємо зміни часу перемикання до надсилання основного повідомлення,
     // щоб попередження було першим рядком у ньому, а не окремим повідомленням.
     const switchingScheduleChanged = await processSwitchingAlerts(
       todaySchedules,
-      today,
-    )
+      today
+    );
 
     const notificationText = switchingScheduleChanged
       ? [
@@ -1128,58 +1084,58 @@ async function run() {
           "",
           addOutageBanner(todayMessage.text, outageMode),
         ].join("\n")
-      : addOutageBanner(todayMessage.text, outageMode)
+      : addOutageBanner(todayMessage.text, outageMode);
 
     await sendNotification({
       text: notificationText,
       scheduleText: `MODE:${outageMode}|${todayMessage.scheduleText}`,
-    })
+    });
   } else {
-    console.log("🔋 No schedule data found for today.")
+    console.log("🔋 No schedule data found for today.");
 
     const noScheduleText = [
       "⚠️ <b>Графік відключень на сьогодні ще не опублікований або недоступний.</b>",
       "",
       `🕒 <i>Останнє оновлення ДТЕК: ${result.update ?? "невідомо"}</i>`,
       `🤖 <i>Остання перевірка ботом: ${getCurrentTime()}</i>`,
-    ].join("\n")
+    ].join("\n");
 
     await sendNotification({
       text: addOutageBanner(noScheduleText, outageMode),
       scheduleText: `MODE:${outageMode}|NO_SCHEDULE`,
-    })
+    });
   }
 
-  const tomorrow = dates.find((date) => date > today)
+  const tomorrow = dates.find((date) => date > today);
 
   if (!tomorrow) {
-    console.log("🟡 No data available for tomorrow.")
-    return
+    console.log("🟡 No data available for tomorrow.");
+    return;
   }
 
-  const tomorrowSchedules = getAvailableSchedules(data, tomorrow)
+  const tomorrowSchedules = getAvailableSchedules(data, tomorrow);
 
   if (!tomorrowSchedules) {
-    console.log("🟡 Tomorrow's schedule has not been published yet.")
-    return
+    console.log("🟡 Tomorrow's schedule has not been published yet.");
+    return;
   }
 
-  const formattedTomorrow = formatScheduleDate(tomorrow)
+  const formattedTomorrow = formatScheduleDate(tomorrow);
 
   const tomorrowMessage = generateMessage(
     tomorrowSchedules,
     result.update,
     `завтра — ${formattedTomorrow}`
-  )
+  );
 
   await sendTomorrowNotification({
     text: addOutageBanner(tomorrowMessage.text, outageMode),
     scheduleText: `MODE:${outageMode}|${tomorrowMessage.scheduleText}`,
     scheduleDate: tomorrow,
-  })
+  });
 }
 
 run().catch((error) => {
-  console.error(error.message)
-  process.exitCode = 1
-})
+  console.error(error.message);
+  process.exitCode = 1;
+});
